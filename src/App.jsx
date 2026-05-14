@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
-import Home    from "./pages/Home";
-import History from "./pages/History";
+import Home          from "./pages/Home";
+import History       from "./pages/History";
+import FloatingTimer from "./FloatingTimer";
 
 function useRouter() {
   const getPage = () => {
@@ -27,6 +28,7 @@ export default function App() {
     <>
       {page === "home"    && <Home    navigate={navigate} />}
       {page === "history" && <History navigate={navigate} />}
+      <FloatingTimer navigate={navigate} />
     </>
   );
 }

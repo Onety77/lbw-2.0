@@ -1,7 +1,8 @@
 /**
- * Last Buyer Wins — Engine v3
- * Detection: WebSocket (Helius) + 4s poll backup
- * Balance: direct RPC wallet balance
+ * Last Buyer Wins — Engine v4
+ * - Filters out wallets holding 5%+ of supply (bonding curve, whales)
+ * - WebSocket + 4s poll backup
+ * - Direct RPC balance
  */
 
 require("dotenv").config();
@@ -11,18 +12,21 @@ const {
   Connection, PublicKey, Transaction, SystemProgram,
   Keypair, sendAndConfirmTransaction, LAMPORTS_PER_SOL,
 } = require("@solana/web3.js");
-const bs58 = require("bs58");
+const bs58  = require("bs58");
+const https = require("https");
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getFirestore, FieldValue, Timestamp } = require("firebase-admin/firestore");
 
 // ── CONFIG ────────────────────────────────────────────────────────────────────
-const CREATOR_WALLET  = process.env.CREATOR_WALLET;
-const TOKEN_CA        = process.env.TOKEN_CA;
-const SOLANA_RPC      = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
-const GAS_RESERVE_SOL = parseFloat(process.env.GAS_RESERVE_SOL || "0.1");
-const MIN_BUY_SOL     = parseFloat(process.env.MIN_BUY_SOL     || "0.1");
-const TIMER_MS        = parseInt(process.env.TIMER_MS          || "60000");
-const POLL_MS         = 4000;
+const CREATOR_WALLET    = process.env.CREATOR_WALLET;
+const TOKEN_CA          = process.env.TOKEN_CA;
+const SOLANA_RPC        = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
+const ST_API_KEY        = process.env.SOLANATRACKER_API_KEY || "";
+const GAS_RESERVE_SOL   = parseFloat(process.env.GAS_RESERVE_SOL   || "0.1");
+const MIN_BUY_SOL       = parseFloat(process.env.MIN_BUY_SOL        || "0.1");
+const TIMER_MS          = parseInt(process.env.TIMER_MS             || "60000");
+const MAX_HOLDER_PCT    = parseFloat(process.env.MAX_HOLDER_PCT     || "5"); // disqualify if holding 5%+
+const POLL_MS           = 4000;
 
 // ── VALIDATE ──────────────────────────────────────────────────────────────────
 ["CREATOR_PRIVATE_KEY","FIREBASE_SERVICE_ACCOUNT_JSON","CREATOR_WALLET","TOKEN_CA"]
@@ -55,12 +59,26 @@ async function withRetry(fn, retries = 3) {
   }
 }
 
-// ── BALANCE — direct RPC, no SolanaTracker needed ─────────────────────────────
+// ── HTTP FETCH (no node-fetch needed) ────────────────────────────────────────
+function fetchJSON(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers }, (res) => {
+      let data = "";
+      res.on("data", chunk => data += chunk);
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(new Error("JSON parse error")); }
+      });
+    });
+    req.on("error", reject);
+    req.setTimeout(8000, () => { req.destroy(); reject(new Error("Timeout")); });
+  });
+}
+
+// ── BALANCE ───────────────────────────────────────────────────────────────────
 async function getWalletBalance() {
-  const lamports = await withRetry(() =>
-    connection.getBalance(new PublicKey(CREATOR_WALLET))
-  );
-  return lamports / LAMPORTS_PER_SOL;
+  const lam = await withRetry(() => connection.getBalance(new PublicKey(CREATOR_WALLET)));
+  return lam / LAMPORTS_PER_SOL;
 }
 
 async function sendSOL(to, lamports) {
@@ -74,7 +92,53 @@ async function sendSOL(to, lamports) {
   );
 }
 
-// ── LEADERBOARD ───────────────────────────────────────────────────────────────
+// ── HOLDER CHECK — disqualify wallets holding MAX_HOLDER_PCT% or more ─────────
+// Uses on-chain token supply + wallet balance — no API key needed
+async function isQualifiedBuyer(walletAddress) {
+  try {
+    const mintPubkey   = new PublicKey(TOKEN_CA);
+    const walletPubkey = new PublicKey(walletAddress);
+
+    // Get wallet's token balance
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+      walletPubkey, { mint: mintPubkey }
+    );
+
+    if (tokenAccounts.value.length === 0) {
+      // No token account — they bought but tokens haven't settled yet
+      // Allow them through — they're definitely not a whale with 5%
+      return { qualified: true, holdingPct: 0 };
+    }
+
+    const walletTokenBalance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount.uiAmount || 0;
+
+    // Get total supply
+    const mintInfo    = await connection.getParsedAccountInfo(mintPubkey);
+    const totalSupply = mintInfo.value?.data?.parsed?.info?.supply
+      ? parseInt(mintInfo.value.data.parsed.info.supply) / Math.pow(10, mintInfo.value.data.parsed.info.decimals)
+      : null;
+
+    if (!totalSupply || totalSupply === 0) {
+      // Can't determine supply — let them through
+      return { qualified: true, holdingPct: 0 };
+    }
+
+    const holdingPct = (walletTokenBalance / totalSupply) * 100;
+
+    if (holdingPct >= MAX_HOLDER_PCT) {
+      return { qualified: false, holdingPct };
+    }
+
+    return { qualified: true, holdingPct };
+
+  } catch (e) {
+    log(`  [holder check] Error for ${walletAddress.slice(0,8)}: ${e.message} — allowing`);
+    // On error, allow the buyer through — don't block legitimate buys
+    return { qualified: true, holdingPct: 0 };
+  }
+}
+
+// ── LEADERBOARD LOGIC ─────────────────────────────────────────────────────────
 function calculateShares(entries, potSOL) {
   const n = entries.length;
   if (n === 0) return [];
@@ -108,7 +172,6 @@ let lastSigSeen   = null;
 async function pushState() {
   const potSOL     = await getWalletBalance().catch(() => 0);
   const withShares = calculateShares(leaderboard, potSOL);
-
   await db.doc("lbw_stats/global").set({
     currentPotSOL: potSOL,
     leaderboard: withShares.map(e => ({
@@ -124,7 +187,6 @@ async function pushState() {
     lastBuyAt:  leaderboard[0] ? Timestamp.fromMillis(leaderboard[0].tsMs) : null,
     lastBuySOL: leaderboard[0]?.amount || null,
   }, { merge: true });
-
   return potSOL;
 }
 
@@ -141,10 +203,17 @@ function resetTimer() {
 
 // ── ON QUALIFYING BUY ─────────────────────────────────────────────────────────
 async function onBuy(wallet, solAmount, sig, tsMs) {
-  log(`  ★ NEW LEADER: ${wallet.slice(0, 8)}... ◎${solAmount.toFixed(4)}`);
+  // Check holder percentage — disqualify whales and bonding curve
+  const { qualified, holdingPct } = await isQualifiedBuyer(wallet);
+  if (!qualified) {
+    log(`  [skip] ${wallet.slice(0,8)}... holds ${holdingPct.toFixed(1)}% — disqualified (>${MAX_HOLDER_PCT}%)`);
+    return;
+  }
+
+  log(`  ★ NEW LEADER: ${wallet.slice(0,8)}... ◎${solAmount.toFixed(4)} (holds ${holdingPct.toFixed(2)}%)`);
   leaderboard = addToLeaderboard(leaderboard, { wallet, amount: solAmount, sig, tsMs });
   const pot = await pushState().catch(() => 0);
-  log(`  Pot: ◎${pot.toFixed(4)} | Leaderboard: ${leaderboard.length} players`);
+  log(`  Pot: ◎${pot.toFixed(4)} | Players: ${leaderboard.length}`);
   resetTimer();
 }
 
@@ -157,24 +226,23 @@ async function triggerPayout() {
     return;
   }
 
-  isPayingOut = true;
+  isPayingOut    = true;
   const snapshot = [...leaderboard];
   const n        = snapshot.length;
   log(`\n${"=".repeat(50)}`);
   log(`PAYOUT — Round ${roundNumber} — ${n} winner${n > 1 ? "s" : ""}`);
 
   try {
-    const balSOL = await getWalletBalance();
-    const gasSOL = GAS_RESERVE_SOL;
-    let sendSOLAmt = balSOL - gasSOL;
+    const balSOL   = await getWalletBalance();
+    let sendSOLAmt = balSOL - GAS_RESERVE_SOL;
 
     if (sendSOLAmt <= 0) {
-      log("Pot empty — waiting 30s for fees to land...");
+      log("Pot empty — waiting 30s for fees...");
       await sleep(30000);
       const bal2 = await getWalletBalance();
-      sendSOLAmt = bal2 - gasSOL;
+      sendSOLAmt = bal2 - GAS_RESERVE_SOL;
       if (sendSOLAmt <= 0) {
-        log("Still empty — starting new round.");
+        log("Still empty — new round.");
         await startNewRound();
         isPayingOut = false;
         return;
@@ -182,9 +250,8 @@ async function triggerPayout() {
     }
 
     const sendLam = Math.floor(sendSOLAmt * LAMPORTS_PER_SOL);
-    log(`Pot: ◎${sendSOLAmt.toFixed(6)} | Gas reserved: ◎${gasSOL}`);
+    log(`Pot: ◎${sendSOLAmt.toFixed(6)}`);
 
-    // Calculate lamports per winner
     const payouts = snapshot.map((e, i) => {
       let lam;
       if (n === 1)      lam = sendLam;
@@ -193,11 +260,10 @@ async function triggerPayout() {
       return { ...e, lam, sol: lam / LAMPORTS_PER_SOL };
     });
 
-    // Send sequentially
     const results = [];
     for (const p of payouts) {
       try {
-        log(`  → ◎${p.sol.toFixed(6)} to pos ${p.position} ${p.wallet.slice(0, 8)}...`);
+        log(`  → ◎${p.sol.toFixed(6)} to pos ${p.position} ${p.wallet.slice(0,8)}...`);
         const txSig = await sendSOL(p.wallet, p.lam);
         log(`    ✓ ${txSig}`);
         results.push({ ...p, txSig, ok: true });
@@ -233,7 +299,7 @@ async function triggerPayout() {
       await db.doc("lbw_stats/global").set({ biggestPot: sendSOLAmt }, { merge: true });
     }
 
-    log(`Round ${roundNumber} complete — ◎${totalPaid.toFixed(6)} distributed`);
+    log(`Round ${roundNumber} done — ◎${totalPaid.toFixed(6)} to ${n} winner${n>1?"s":""}`);
     log(`${"=".repeat(50)}\n`);
 
   } catch (e) {
@@ -288,7 +354,6 @@ async function processTx(sig) {
     const pre  = tx.meta.preBalances  || [];
     const post = tx.meta.postBalances || [];
 
-    // Find account that spent most SOL
     let maxDec = 0, buyerIdx = -1;
     for (let i = 0; i < pre.length; i++) {
       const dec = pre[i] - post[i];
@@ -321,7 +386,7 @@ async function processTx(sig) {
   }
 }
 
-// ── WEBSOCKET — fires instantly on every tx ───────────────────────────────────
+// ── WEBSOCKET ─────────────────────────────────────────────────────────────────
 function startWebSocket(mintPubkey) {
   log(`WebSocket subscribing to mint: ${TOKEN_CA}`);
   try {
@@ -329,25 +394,23 @@ function startWebSocket(mintPubkey) {
       mintPubkey,
       async ({ signature, err }) => {
         if (err) return;
-        log(`  [ws] ${signature.slice(0, 16)}...`);
+        log(`  [ws] ${signature.slice(0,16)}...`);
         await processTx(signature);
       },
       "confirmed"
     );
     log("WebSocket active.");
   } catch (e) {
-    log(`WebSocket failed: ${e.message} — poll backup will handle detection`);
+    log(`WebSocket failed: ${e.message} — poll will handle detection`);
   }
 }
 
-// ── POLL — backup every 4s to catch anything WebSocket misses ─────────────────
+// ── POLL BACKUP ───────────────────────────────────────────────────────────────
 async function pollLoop(mintPubkey) {
   log(`Poll backup every ${POLL_MS / 1000}s`);
-
   while (true) {
     await sleep(POLL_MS);
     if (isPayingOut) continue;
-
     try {
       const opts = { limit: 10, commitment: "confirmed" };
       if (lastSigSeen) opts.until = lastSigSeen;
@@ -356,28 +419,23 @@ async function pollLoop(mintPubkey) {
       if (!sigs || sigs.length === 0) continue;
 
       if (!lastSigSeen) {
-        // First poll — set cursor only, don't replay history
         lastSigSeen = sigs[0].signature;
-        log(`Poll cursor set: ${lastSigSeen.slice(0, 16)}...`);
+        log(`Poll cursor set: ${lastSigSeen.slice(0,16)}...`);
         continue;
       }
 
       const fresh = sigs.filter(s => !s.err);
       if (fresh.length > 0) {
         lastSigSeen = fresh[0].signature;
-        log(`  [poll] ${fresh.length} new tx(s)`);
-        for (const s of fresh) {
-          await processTx(s.signature);
-        }
+        for (const s of fresh) await processTx(s.signature);
       }
-
     } catch (e) {
       log(`  [poll] error: ${e.message}`);
     }
   }
 }
 
-// ── BALANCE UPDATE ────────────────────────────────────────────────────────────
+// ── BALANCE LOOP ──────────────────────────────────────────────────────────────
 async function balanceLoop() {
   while (true) {
     await sleep(15_000);
@@ -389,15 +447,14 @@ async function balanceLoop() {
 }
 
 // ── BOOT ──────────────────────────────────────────────────────────────────────
-console.log(`
-  LAST BUYER WINS — Engine v3
-`);
+console.log(`\n  LAST BUYER WINS — Engine v4\n`);
 log(`Wallet      : ${CREATOR_WALLET}`);
 log(`Token       : ${TOKEN_CA}`);
 log(`Min Buy     : ◎${MIN_BUY_SOL} SOL`);
 log(`Timer       : ${TIMER_MS / 1000}s`);
 log(`Gas Reserve : ◎${GAS_RESERVE_SOL}`);
-log(`Detection   : WebSocket + ${POLL_MS / 1000}s poll backup`);
+log(`Max Holding : ${MAX_HOLDER_PCT}% (above this = disqualified)`);
+log(`Detection   : WebSocket + ${POLL_MS/1000}s poll backup`);
 log(`RPC         : ${SOLANA_RPC.split("?")[0]}`);
 log("─".repeat(50));
 
