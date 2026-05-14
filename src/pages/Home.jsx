@@ -329,6 +329,7 @@ export default function Home({ navigate }) {
 
   const winAtRef  = useRef(null);
   const isLive    = TOKEN_CA !== "PASTE_TOKEN_CA_HERE";
+  const [solPrice, setSolPrice] = useState(null);
 
   // Stats subscription
   useEffect(() => {
@@ -347,6 +348,20 @@ export default function Home({ navigate }) {
   useEffect(() => {
     const q = query(collection(db, "lbw_history"), orderBy("timestamp","desc"), limit(5));
     return onSnapshot(q, snap => setWinners(snap.docs.map(d => ({ id:d.id, ...d.data() }))));
+  }, []);
+
+  // SOL price from CoinGecko — no API key needed
+  useEffect(() => {
+    const fetch = async () => {
+      try {
+        const res  = await window.fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
+        const data = await res.json();
+        if (data?.solana?.usd) setSolPrice(data.solana.usd);
+      } catch {}
+    };
+    fetch();
+    const id = setInterval(fetch, 60_000);
+    return () => clearInterval(id);
   }, []);
 
   // Countdown tick
@@ -463,6 +478,11 @@ export default function Home({ navigate }) {
           <div style={{ fontFamily:"'Space Mono',monospace", fontSize:isMobile?"clamp(28px,8vw,40px)":"clamp(36px,5vw,56px)", fontWeight:700, color:"var(--white)" }}>
             ◎ {fmtSOL(currentPot, 4)}
           </div>
+          {potUSD != null && (
+            <div style={{ fontFamily:"'Inter',sans-serif", fontSize:isMobile?16:20, fontWeight:600, color:"rgba(57,255,20,0.7)", marginTop:4 }}>
+              ≈ ${potUSD.toFixed(2)} USD
+            </div>
+          )}
           <div style={{ fontFamily:"'Inter',sans-serif", fontSize:10, color:"var(--grey)", marginTop:6 }}>
             distributed to {leaderboard.length > 0 ? `top ${leaderboard.length} buyer${leaderboard.length>1?"s":""}` : "last buyer"}
           </div>
