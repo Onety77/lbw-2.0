@@ -594,8 +594,8 @@ export default function Home({ navigate }) {
           {[
             { n:"01", title:"BUY",      desc:`Spend ◎${MIN_BUY}+ SOL in a single buy to enter the leaderboard.` },
             { n:"02", title:"LEAD",     desc:"Every qualifying buy resets the countdown and puts you at position 1." },
-            { n:"03", title:"SURVIVE",  desc:"Stay in the top 10 when the timer hits zero. Top 10 = top 10 wins." },
-            { n:"04", title:"WIN",      desc:"Leader takes 50%. The rest of the pot splits equally among positions 2-10." },
+            { n:"03", title:"SURVIVE",  desc:"Stay in the top 5 when the timer hits zero. Top 5 = top 5 wins." },
+            { n:"04", title:"WIN",      desc:"Leader takes 50%. The rest of the pot splits equally among positions 2-5." },
           ].map((s, i) => (
             <div key={s.n} style={{ padding:isMobile?"16px 14px":"24px 20px", background:"var(--bg2)", borderRight:"1px solid var(--border)" }}>
               <div style={{ fontFamily:"'Space Mono',monospace", fontSize:isMobile?24:32, color:"rgba(57,255,20,0.12)", fontWeight:700, lineHeight:1, marginBottom:10 }}>{s.n}</div>

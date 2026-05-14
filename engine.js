@@ -137,7 +137,7 @@ function addToLeaderboard(current, newEntry) {
   // Remove same wallet if already in board (they rebought — move to front)
   const without = current.filter(e => e.wallet !== newEntry.wallet);
   // Add at front, keep max 10
-  return [newEntry, ...without].slice(0, 10);
+  return [newEntry, ...without].slice(0, 6);
 }
 
 // ── STATE ─────────────────────────────────────────────────────────────────────
