@@ -454,7 +454,7 @@ log(`Token       : ${TOKEN_CA}`);
 log(`Min Buy     : ◎${MIN_BUY_SOL} SOL`);
 log(`Timer       : ${TIMER_MS/1000}s`);
 log(`Gas Reserve : ◎${GAS_RESERVE_SOL}`);
-log(`Pool        : ${RAYDIUM_POOL || "bonding curve (auto-detect graduation)"}`);
+log(`Detection   : Token mint WebSocket — works on any DEX`);
 log("─".repeat(50));
 
 // Init global stats doc if first time
