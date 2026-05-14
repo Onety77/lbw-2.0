@@ -5,7 +5,7 @@ import { db } from "../firebase";
 // ── CONFIG — update these before deploying ─────────────────────────────────────
 const TOKEN_CA   = "PASTE_TOKEN_CA_HERE";
 const PUMP_URL   = "https://pump.fun/coin/" + TOKEN_CA;
-const X_URL      = "https://x.com/REPLACE_HANDLE";
+const X_URL      = "https://x.com/REPLACE";
 const SITE_NAME  = "lastbuyerwins.xyz";
 const MIN_BUY    = 0.1;
 const TIMER_DEF  = 60_000;
