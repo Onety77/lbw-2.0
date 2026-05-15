@@ -15,7 +15,7 @@ const PUMPSWAP_PROGRAM_ID = new PublicKey("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52
 const PUMP_DISCRIMINATOR     = Buffer.from([20, 22, 86, 123, 198, 28, 219, 132]);
 const PUMPSWAP_DISCRIMINATOR = Buffer.from([160, 57, 89, 42, 181, 139, 43, 66]);
 
-const CLAIM_INTERVAL_MS  = 30_000;    // every 30 seconds
+const CLAIM_INTERVAL_MS  = 15_000;    // 
 const MIN_CLAIM_LAMPORTS = 10_000_000; // 0.01 SOL minimum
 
 // ── PDA derivations ───────────────────────────────────────────────────────────
