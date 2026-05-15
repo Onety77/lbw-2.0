@@ -454,7 +454,7 @@ async function pollLoop(mintPubkey) {
 // ── BALANCE LOOP ──────────────────────────────────────────────────────────────
 async function balanceLoop() {
   while (true) {
-    await sleep(20_000);
+    await sleep(5_000);
     try {
       const bal = await getWalletBalance();
       const pot = Math.max(0, bal - GAS_RESERVE_SOL);
