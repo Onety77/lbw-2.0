@@ -3,8 +3,8 @@ import { doc, onSnapshot, collection, query, orderBy, limit } from "firebase/fir
 import { db } from "../firebase";
 
 // ── CONFIG ─────────────────────────────────────────────────────────────────────
-const TOKEN_CA  = "PASTE_TOKEN_CA_HERE";
-const PUMP_URL  = "https://pump.fun/coin/" + TOKEN_CA;
+const TOKEN_CA  = "Exmff76TBNGYxob2WEJb28c12R6TjSvLv2zpbo6Xpump";
+const PUMP_URL  = "https://pump.fun/coin/Exmff76TBNGYxob2WEJb28c12R6TjSvLv2zpbo6Xpump/" + TOKEN_CA;
 const X_URL     = "https://x.com/REPLACE_HANDLE";
 const MIN_BUY   = 0.1;
 const TIMER_DEF = 60_000;
