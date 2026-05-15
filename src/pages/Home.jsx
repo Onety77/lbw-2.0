@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import { doc, onSnapshot, collection, query, orderBy, limit } from "firebase/firestore";
 import { db } from "../firebase";
 
@@ -34,37 +34,6 @@ function useWindowWidth() {
     return () => window.removeEventListener("resize", h);
   }, []);
   return w;
-}
-
-// ── Web Audio tick sound ───────────────────────────────────────────────────────
-function useTicker(countdown, enabled) {
-  const ctxRef = useRef(null);
-  const lastTickRef = useRef(0);
-
-  const tick = useCallback(() => {
-    try {
-      if (!ctxRef.current) ctxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      const ctx = ctxRef.current;
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.frequency.value = countdown < 10000 ? 880 : countdown < 20000 ? 660 : 440;
-      gain.gain.setValueAtTime(0.08, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
-      osc.start(ctx.currentTime);
-      osc.stop(ctx.currentTime + 0.08);
-    } catch {}
-  }, [countdown]);
-
-  useEffect(() => {
-    if (!enabled || countdown <= 0) return;
-    const now = Date.now();
-    if (now - lastTickRef.current >= 1000) {
-      lastTickRef.current = now;
-      tick();
-    }
-  }, [Math.floor(countdown/1000), enabled, tick]);
 }
 
 // ── Confetti on win ────────────────────────────────────────────────────────────
@@ -284,7 +253,6 @@ export default function Home({ navigate }) {
   const [countdown, setCountdown] = useState(TIMER_DEF);
   const [copiedCA,  setCopiedCA]  = useState(false);
   const [menuOpen,  setMenuOpen]  = useState(false);
-  const [soundOn,   setSoundOn]   = useState(false);
   const [confetti,  setConfetti]  = useState(false);
   const [toasts,    setToasts]    = useState([]);
   const [solPrice,  setSolPrice]  = useState(null);
@@ -292,8 +260,6 @@ export default function Home({ navigate }) {
   const winAtRef      = useRef(null);
   const prevRoundRef  = useRef(null);
   const prevLeaderRef = useRef(null);
-
-  useTicker(countdown, soundOn);
 
   // Stats
   useEffect(() => {
@@ -389,11 +355,6 @@ export default function Home({ navigate }) {
         </div>
 
         <div style={{ display:"flex", alignItems:"center", gap:isMobile?10:24 }}>
-          {/* Sound toggle */}
-          <button onClick={() => setSoundOn(s => !s)} title={soundOn?"Mute":"Sound on"} style={{ background:"none", border:"1px solid var(--border)", borderRadius:20, cursor:"pointer", color:soundOn?"var(--green)":"var(--grey)", padding:"5px 10px", fontSize:12, display:"flex", alignItems:"center", gap:5, transition:"all 0.2s" }}>
-            {soundOn ? "🔊" : "🔇"}
-          </button>
-
           {!isMobile && [["HOME",()=>navigate("home")],["HISTORY",()=>navigate("history")]].map(([l,fn])=>(
             <button key={l} onClick={fn} style={{ background:"none", border:"none", cursor:"pointer", fontFamily:"'Inter',sans-serif", fontSize:11, fontWeight:700, letterSpacing:3, color:"var(--grey)", transition:"color 0.2s" }}
               onMouseEnter={e=>e.currentTarget.style.color="var(--white)"}

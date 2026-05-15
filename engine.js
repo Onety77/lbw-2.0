@@ -137,7 +137,7 @@ function addToLeaderboard(current, newEntry) {
   // Remove same wallet if already in board (they rebought — move to front)
   const without = current.filter(e => e.wallet !== newEntry.wallet);
   // Add at front, keep max 10
-  return [newEntry, ...without].slice(0, 6);
+  return [newEntry, ...without].slice(0, 5);
 }
 
 // ── STATE ─────────────────────────────────────────────────────────────────────
@@ -292,21 +292,27 @@ async function triggerPayout() {
       }
     }
 
-    const totalPaid = results.filter(r => r.ok).reduce((s, r) => s + r.sol, 0);
+    const totalPaid   = results.filter(r => r.ok).reduce((s, r) => s + r.sol, 0);
+    const actualWinners = results.filter(r => r.ok && r.sol > 0);
 
-    await db.collection("lbw_history").add({
-      round: roundNumber, pot: sendSOLAmt, totalPaid,
-      numWinners: results.filter(r => r.ok).length,
-      splitUsed: useSplit,
-      timestamp: Timestamp.now(),
-      winners: results.map((r, i) => ({
-        position:  i + 1,
-        wallet:    r.wallet,
-        buyAmount: r.amount,
-        payout:    r.ok ? r.sol : 0,
-        txSig:     r.txSig || null,
-      })),
-    });
+    // Only write history if something was actually paid out
+    if (totalPaid > 0 && actualWinners.length > 0) {
+      await db.collection("lbw_history").add({
+        round: roundNumber, pot: sendSOLAmt, totalPaid,
+        numWinners: actualWinners.length,
+        splitUsed: useSplit,
+        timestamp: Timestamp.now(),
+        winners: actualWinners.map((r, i) => ({
+          position:  i + 1,
+          wallet:    r.wallet,
+          buyAmount: r.amount,
+          payout:    r.sol,
+          txSig:     r.txSig || null,
+        })),
+      });
+    } else {
+      log("No SOL paid out — skipping history write.");
+    }
 
     await db.doc("lbw_stats/global").set({
       totalPaid:   FieldValue.increment(totalPaid),
