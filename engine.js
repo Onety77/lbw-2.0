@@ -26,7 +26,7 @@ const MIN_BUY_SOL     = parseFloat(process.env.MIN_BUY_SOL     || "0.1");
 const TIMER_MS        = parseInt(process.env.TIMER_MS          || "60000");
 const MAX_HOLDER_PCT  = parseFloat(process.env.MAX_HOLDER_PCT  || "5");
 const SPLIT_THRESHOLD = parseFloat(process.env.SPLIT_THRESHOLD || "1.0"); // SOL
-const POLL_MS         = 6000; // poll every 6s — relaxed to avoid 429s
+const POLL_MS         = 3000; // poll every 3s
 
 // ── VALIDATE ──────────────────────────────────────────────────────────────────
 ["CREATOR_PRIVATE_KEY","FIREBASE_SERVICE_ACCOUNT_JSON","CREATOR_WALLET","TOKEN_CA"]
@@ -228,11 +228,12 @@ async function onBuy(wallet, solAmount, sig, tsMs) {
   log(`  ★ NEW LEADER: ${wallet.slice(0,8)}... ◎${solAmount.toFixed(4)}`);
   leaderboard = addToLeaderboard(leaderboard, { wallet, amount: solAmount, sig, tsMs });
 
-  const pot = await getWalletBalance().catch(() => 0);
+  const bal = await getWalletBalance().catch(() => 0);
+  const pot = Math.max(0, bal - GAS_RESERVE_SOL);
   await pushState(pot).catch(e => log(`  Firestore error: ${e.message}`));
 
   const splitActive = pot >= SPLIT_THRESHOLD;
-  log(`  Pot: ◎${pot.toFixed(4)} | Players: ${leaderboard.length}/5 | Split: ${splitActive ? "YES" : "NO (below ◎"+SPLIT_THRESHOLD+")"}`);
+  log(`  Pot: ◎${pot.toFixed(4)} | Players: ${leaderboard.length}/10 | Split: ${splitActive ? "YES" : "NO (below ◎"+SPLIT_THRESHOLD+")"}`);
 
   resetTimer();
 }
@@ -346,7 +347,8 @@ async function startNewRound() {
   txQueue.length = 0;
   log(`Round ${roundNumber} started.`);
 
-  const pot = await getWalletBalance().catch(() => 0);
+  const bal = await getWalletBalance().catch(() => 0);
+  const pot = Math.max(0, bal - GAS_RESERVE_SOL);
   await db.doc("lbw_stats/global").set({
     currentPotSOL: pot, leaderboard: [],
     lastBuyer: null, lastBuyAt: null, lastBuySOL: null,
@@ -454,7 +456,8 @@ async function balanceLoop() {
   while (true) {
     await sleep(20_000);
     try {
-      const pot = await getWalletBalance();
+      const bal = await getWalletBalance();
+      const pot = Math.max(0, bal - GAS_RESERVE_SOL);
       await db.doc("lbw_stats/global").set({ currentPotSOL: pot }, { merge: true });
     } catch {}
   }
