@@ -81,7 +81,7 @@ function BuyToast({ toasts }) {
   const visible = toasts.slice(-2);
   return (
     <div style={{
-      position:"fixed", bottom:80, right:24, zIndex:500,
+      position:"fixed", top:80, right:20, zIndex:500,
       display:"flex", flexDirection:"column", gap:6,
       pointerEvents:"none", alignItems:"flex-end",
       maxWidth:220,
@@ -266,6 +266,7 @@ export default function Home({ navigate }) {
   const winAtRef      = useRef(null);
   const prevRoundRef  = useRef(null);
   const prevLeaderRef = useRef(null);
+  const lockedRef     = useRef(false);
 
   // Stats
   useEffect(() => {
@@ -273,7 +274,10 @@ export default function Home({ navigate }) {
       if (!snap.exists()) return;
       const d = snap.data();
       setStats(d);
-      if (d.nextWinAt) winAtRef.current = d.nextWinAt.toMillis();
+      if (d.nextWinAt) {
+        const nextMs = d.nextWinAt.toMillis();
+        if (nextMs > Date.now()) { winAtRef.current = nextMs; lockedRef.current = false; }
+      }
 
       // Detect new round — fire confetti
       if (prevRoundRef.current !== null && d.totalRounds > prevRoundRef.current) {
@@ -305,11 +309,15 @@ export default function Home({ navigate }) {
     return onSnapshot(q, snap => setWinners(snap.docs.map(d => ({id:d.id,...d.data()}))));
   }, []);
 
-  // Countdown
+  // Countdown — locks at 00:00 during payout processing
   useEffect(() => {
     const id = setInterval(() => {
-      if (winAtRef.current) setCountdown(Math.max(0, winAtRef.current - Date.now()));
-    }, 500);
+      if (!winAtRef.current) return;
+      const rem = winAtRef.current - Date.now();
+      if (rem <= 0) { setCountdown(0); lockedRef.current = true; return; }
+      if (lockedRef.current) return;
+      setCountdown(rem);
+    }, 200);
     return () => clearInterval(id);
   }, []);
 

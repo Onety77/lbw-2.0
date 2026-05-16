@@ -10,58 +10,96 @@ const fmtTime = (ms) => {
   return `${String(Math.floor(s / 60)).padStart(2,"0")}:${String(s % 60).padStart(2,"0")}`;
 };
 
-// Play a tick using Web Audio API
-function playTick(urgent) {
-  try {
-    const ctx  = new (window.AudioContext || window.webkitAudioContext)();
-    const osc  = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    // Higher pitch and slightly louder as urgency increases
-    osc.frequency.value = urgent ? 1000 : 520;
-    gain.gain.setValueAtTime(urgent ? 0.12 : 0.06, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
-    osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + 0.08);
-    // Close context after sound finishes to avoid memory leak
-    setTimeout(() => ctx.close(), 200);
-  } catch {}
-}
-
 export default function FloatingTimer() {
   const [countdown, setCountdown] = useState(TIMER_DEF);
   const [visible,   setVisible]   = useState(true);
   const [soundOn,   setSoundOn]   = useState(false);
-  const winAtRef     = useRef(null);
-  const lastSecRef   = useRef(null); // tracks last second that played a tick
 
+  const winAtRef    = useRef(null);
+  const lastSecRef  = useRef(null);
+  const audioCtxRef = useRef(null);  // one persistent AudioContext
+  const soundOnRef  = useRef(false); // ref mirrors state so interval always sees current value
+  const lockedRef   = useRef(false); // true while waiting for new nextWinAt after round ends
+
+  // Keep ref in sync with state
+  useEffect(() => { soundOnRef.current = soundOn; }, [soundOn]);
+
+  // Create AudioContext once on first sound toggle (needs user gesture)
+  const ensureAudioCtx = () => {
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    // Resume if browser suspended it
+    if (audioCtxRef.current.state === "suspended") {
+      audioCtxRef.current.resume();
+    }
+    return audioCtxRef.current;
+  };
+
+  const playTick = (urgent) => {
+    try {
+      const ctx  = ensureAudioCtx();
+      const osc  = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.frequency.value = urgent ? 1000 : 520;
+      gain.gain.setValueAtTime(urgent ? 0.12 : 0.06, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
+      osc.start(ctx.currentTime);
+      osc.stop(ctx.currentTime + 0.08);
+    } catch {}
+  };
+
+  // Firestore listener
   useEffect(() => {
     return onSnapshot(doc(db, "lbw_stats", "global"), snap => {
       if (!snap.exists()) return;
       const d = snap.data();
-      if (d.nextWinAt) winAtRef.current = d.nextWinAt.toMillis();
+      if (d.nextWinAt) {
+        const nextMs = d.nextWinAt.toMillis();
+        // Only accept if it's in the future — this is a fresh round
+        if (nextMs > Date.now()) {
+          winAtRef.current = nextMs;
+          lockedRef.current = false; // unlock — new round started
+          lastSecRef.current = null;  // reset tick tracker
+        }
+      }
     });
   }, []);
 
+  // Countdown interval — stable, never recreated
   useEffect(() => {
     const id = setInterval(() => {
       if (!winAtRef.current) return;
-      const rem = Math.max(0, winAtRef.current - Date.now());
+
+      const rem = winAtRef.current - Date.now();
+
+      if (rem <= 0) {
+        // Timer expired — lock at 00:00 until engine sends new nextWinAt
+        setCountdown(0);
+        if (!lockedRef.current) {
+          lockedRef.current = true;
+          lastSecRef.current = null;
+        }
+        return;
+      }
+
+      if (lockedRef.current) return; // waiting for new round — stay at 00:00
+
       setCountdown(rem);
 
-      // Only tick when the second actually changes
-      if (soundOn && rem > 0) {
+      // Tick only when second changes
+      if (soundOnRef.current) {
         const currentSec = Math.floor(rem / 1000);
         if (currentSec !== lastSecRef.current) {
           lastSecRef.current = currentSec;
-          const urgent = rem < 15_000;
-          playTick(urgent);
+          playTick(rem < 15_000);
         }
       }
-    }, 200); // check every 200ms for precision but tick only on second change
+    }, 200);
     return () => clearInterval(id);
-  }, [soundOn]);
+  }, []); // empty deps — runs once, uses refs for live values
 
   if (!visible) return null;
 
@@ -110,14 +148,14 @@ export default function FloatingTimer() {
       {/* Sound toggle */}
       <button
         onClick={() => {
+          ensureAudioCtx(); // create/resume on user gesture
           setSoundOn(s => !s);
-          lastSecRef.current = null; // reset so next second fires immediately
         }}
         title={soundOn ? "Mute ticking" : "Enable ticking"}
         style={{
           background:"none", border:"none", cursor:"pointer",
           fontSize:12, lineHeight:1, padding:"0 2px",
-          opacity: soundOn ? 1 : 0.4,
+          opacity: soundOn ? 1 : 0.35,
           transition:"opacity 0.2s",
         }}
       >
