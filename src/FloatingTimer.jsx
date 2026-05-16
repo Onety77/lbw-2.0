@@ -10,10 +10,31 @@ const fmtTime = (ms) => {
   return `${String(Math.floor(s / 60)).padStart(2,"0")}:${String(s % 60).padStart(2,"0")}`;
 };
 
+// Play a tick using Web Audio API
+function playTick(urgent) {
+  try {
+    const ctx  = new (window.AudioContext || window.webkitAudioContext)();
+    const osc  = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    // Higher pitch and slightly louder as urgency increases
+    osc.frequency.value = urgent ? 1000 : 520;
+    gain.gain.setValueAtTime(urgent ? 0.12 : 0.06, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.08);
+    // Close context after sound finishes to avoid memory leak
+    setTimeout(() => ctx.close(), 200);
+  } catch {}
+}
+
 export default function FloatingTimer() {
   const [countdown, setCountdown] = useState(TIMER_DEF);
   const [visible,   setVisible]   = useState(true);
-  const winAtRef = useRef(null);
+  const [soundOn,   setSoundOn]   = useState(false);
+  const winAtRef     = useRef(null);
+  const lastSecRef   = useRef(null); // tracks last second that played a tick
 
   useEffect(() => {
     return onSnapshot(doc(db, "lbw_stats", "global"), snap => {
@@ -25,13 +46,22 @@ export default function FloatingTimer() {
 
   useEffect(() => {
     const id = setInterval(() => {
-      if (winAtRef.current) {
-        const rem = winAtRef.current - Date.now();
-        setCountdown(rem > 0 ? rem : 0);
+      if (!winAtRef.current) return;
+      const rem = Math.max(0, winAtRef.current - Date.now());
+      setCountdown(rem);
+
+      // Only tick when the second actually changes
+      if (soundOn && rem > 0) {
+        const currentSec = Math.floor(rem / 1000);
+        if (currentSec !== lastSecRef.current) {
+          lastSecRef.current = currentSec;
+          const urgent = rem < 15_000;
+          playTick(urgent);
+        }
       }
-    }, 500);
+    }, 200); // check every 200ms for precision but tick only on second change
     return () => clearInterval(id);
-  }, []);
+  }, [soundOn]);
 
   if (!visible) return null;
 
@@ -63,19 +93,36 @@ export default function FloatingTimer() {
       {/* Live dot */}
       <div style={{
         width:8, height:8, borderRadius:"50%",
-        background: color, boxShadow:`0 0 8px ${color}`,
-        animation: "blink 1.5s ease infinite", flexShrink:0,
+        background:color, boxShadow:`0 0 8px ${color}`,
+        animation:"blink 1.5s ease infinite", flexShrink:0,
       }}/>
 
       {/* Timer */}
       <div style={{
-        fontFamily:   "'Space Mono',monospace",
-        fontSize:     18, fontWeight:700,
+        fontFamily:  "'Space Mono',monospace",
+        fontSize:    18, fontWeight:700,
         color, letterSpacing:"-0.02em", lineHeight:1,
-        animation: urgent ? "countdown-pulse 0.5s ease infinite" : "none",
+        animation:   urgent ? "countdown-pulse 0.5s ease infinite" : "none",
       }}>
         {fmtTime(countdown)}
       </div>
+
+      {/* Sound toggle */}
+      <button
+        onClick={() => {
+          setSoundOn(s => !s);
+          lastSecRef.current = null; // reset so next second fires immediately
+        }}
+        title={soundOn ? "Mute ticking" : "Enable ticking"}
+        style={{
+          background:"none", border:"none", cursor:"pointer",
+          fontSize:12, lineHeight:1, padding:"0 2px",
+          opacity: soundOn ? 1 : 0.4,
+          transition:"opacity 0.2s",
+        }}
+      >
+        🔔
+      </button>
 
       {/* Close */}
       <button
@@ -83,7 +130,7 @@ export default function FloatingTimer() {
         style={{
           background:"none", border:"none", cursor:"pointer",
           color:"rgba(255,255,255,0.3)", fontSize:13,
-          lineHeight:1, padding:"0 0 0 4px", transition:"color 0.2s",
+          lineHeight:1, padding:"0 0 0 2px", transition:"color 0.2s",
         }}
         onMouseEnter={e => e.currentTarget.style.color="rgba(255,255,255,0.7)"}
         onMouseLeave={e => e.currentTarget.style.color="rgba(255,255,255,0.3)"}

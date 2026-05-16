@@ -3,8 +3,8 @@ import { doc, onSnapshot, collection, query, orderBy, limit } from "firebase/fir
 import { db } from "../firebase";
 
 // ── CONFIG ─────────────────────────────────────────────────────────────────────
-const TOKEN_CA  = "Exmff76TBNGYxob2WEJb28c12R6TjSvLv2zpbo6Xpump";
-const PUMP_URL  = "https://pump.fun/coin/Exmff76TBNGYxob2WEJb28c12R6TjSvLv2zpbo6Xpump/" + TOKEN_CA;
+const TOKEN_CA  = "PASTE_TOKEN_CA_HERE";
+const PUMP_URL  = "https://pump.fun/coin/" + TOKEN_CA;
 const X_URL     = "https://x.com/REPLACE_HANDLE";
 const MIN_BUY   = 0.1;
 const TIMER_DEF = 60_000;
@@ -75,35 +75,41 @@ function Confetti({ active }) {
 }
 
 // ── Buy toast notification ─────────────────────────────────────────────────────
+// Max 2 visible at once. Small pill style. Never covers content.
 function BuyToast({ toasts }) {
+  // Only show the 2 most recent
+  const visible = toasts.slice(-2);
   return (
-    <div style={{ position:"fixed", top:80, right:20, zIndex:500, display:"flex", flexDirection:"column", gap:8, pointerEvents:"none" }}>
-      {toasts.map(t => (
+    <div style={{
+      position:"fixed", bottom:80, right:24, zIndex:500,
+      display:"flex", flexDirection:"column", gap:6,
+      pointerEvents:"none", alignItems:"flex-end",
+      maxWidth:220,
+    }}>
+      {visible.map(t => (
         <div key={t.id} style={{
-          padding: "10px 16px",
-          background: "rgba(13,13,13,0.95)",
-          border: "1px solid rgba(57,255,20,0.3)",
-          borderRadius: 4,
+          padding: "7px 12px",
+          background: "rgba(13,13,13,0.92)",
+          border: "1px solid rgba(57,255,20,0.25)",
+          borderRadius: 20,
           backdropFilter: "blur(12px)",
-          display: "flex", alignItems:"center", gap:10,
-          animation: "toast-in 0.3s ease",
-          boxShadow: "0 4px 20px rgba(0,0,0,0.5)",
+          display: "flex", alignItems:"center", gap:8,
+          animation: "toast-in 0.25s ease",
+          boxShadow: "0 2px 12px rgba(0,0,0,0.4)",
+          whiteSpace:"nowrap",
         }}>
-          <div style={{ width:6, height:6, borderRadius:"50%", background:"var(--green)", boxShadow:"0 0 6px var(--green)", flexShrink:0 }}/>
-          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:11, color:"var(--white)" }}>
+          <div style={{ width:5, height:5, borderRadius:"50%", background:"var(--green)", flexShrink:0 }}/>
+          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:10, color:"var(--white)" }}>
             {short(t.wallet)}
           </span>
-          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:11, color:"var(--green)", fontWeight:700 }}>
+          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:10, color:"var(--green)", fontWeight:700 }}>
             ◎{fmtSOL(t.amount, 3)}
-          </span>
-          <span style={{ fontFamily:"'Inter',sans-serif", fontSize:10, color:"var(--grey)" }}>
-            #{t.position}
           </span>
         </div>
       ))}
       <style>{`
         @keyframes toast-in {
-          from { opacity:0; transform:translateX(20px); }
+          from { opacity:0; transform:translateX(10px); }
           to   { opacity:1; transform:translateX(0); }
         }
       `}</style>
@@ -286,7 +292,7 @@ export default function Home({ navigate }) {
     if (top?.wallet && top.wallet !== prevLeaderRef.current) {
       if (prevLeaderRef.current !== null) {
         const id = Date.now();
-        setToasts(t => [...t.slice(-3), { id, wallet:top.wallet, amount:top.amount, position:top.position }]);
+        setToasts(t => [...t.slice(-1), { id, wallet:top.wallet, amount:top.amount, position:top.position }]);
         setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4000);
       }
       prevLeaderRef.current = top.wallet;
@@ -478,6 +484,12 @@ export default function Home({ navigate }) {
             <div style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"var(--grey-dim)", letterSpacing:1, textAlign:"center" }}>
               min ◎{MIN_BUY} SOL to qualify · top 5 wallets win
             </div>
+            <div style={{ display:"flex", alignItems:"center", gap:6, justifyContent:"center", padding:"8px 12px", background:"rgba(255,32,32,0.04)", border:"1px solid rgba(255,32,32,0.12)", borderRadius:4 }}>
+              <span style={{ fontSize:10 }}>🚫</span>
+              <span style={{ fontFamily:"'Inter',sans-serif", fontSize:9, color:"var(--grey)", letterSpacing:1 }}>
+                Wallets holding <strong style={{ color:"var(--red)" }}>≥ 3.5%</strong> of supply are disqualified from winning
+              </span>
+            </div>
           </div>
         </div>
       </section>
@@ -536,7 +548,7 @@ export default function Home({ navigate }) {
           {[
             { n:"01", title:"BUY",     desc:`Spend ◎${MIN_BUY}+ SOL to enter the leaderboard at position 1.` },
             { n:"02", title:"LEAD",    desc:"Every qualifying buy resets the countdown. You're the leader." },
-            { n:"03", title:"HOLD",    desc:"Stay in the top 5 when the timer hits zero." },
+            { n:"03", title:"HOLD",    desc:"Stay in the top 5 when the timer hits zero. Wallets holding ≥3.5% of supply are disqualified." },
             { n:"04", title:"WIN",     desc:"Leader takes 50%. Positions 2-5 split the other 50% equally." },
           ].map(s => (
             <div key={s.n} style={{ padding:isMobile?"16px 12px":"22px 18px", background:"var(--bg2)", borderRight:"1px solid var(--border)", position:"relative", overflow:"hidden" }}>
