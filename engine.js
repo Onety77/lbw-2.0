@@ -233,7 +233,7 @@ async function onBuy(wallet, solAmount, sig, tsMs) {
   await pushState(pot).catch(e => log(`  Firestore error: ${e.message}`));
 
   const splitActive = pot >= SPLIT_THRESHOLD;
-  log(`  Pot: ◎${pot.toFixed(4)} | Players: ${leaderboard.length}/10 | Split: ${splitActive ? "YES" : "NO (below ◎"+SPLIT_THRESHOLD+")"}`);
+  log(`  Pot: ◎${pot.toFixed(4)} | Players: ${leaderboard.length}/5 | Split: ${splitActive ? "YES" : "NO (below ◎"+SPLIT_THRESHOLD+")"}`);
 
   resetTimer();
 }
