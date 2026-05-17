@@ -6,8 +6,8 @@ import { db } from "../firebase";
 const TOKEN_CA  = "Exmff76TBNGYxob2WEJb28c12R6TjSvLv2zpbo6Xpump";
 const PUMP_URL  = "https://pump.fun/coin/" + TOKEN_CA;
 const X_URL     = "https://x.com/LastBuyerWins26";
-const MIN_BUY   = 0.2;
-const TIMER_DEF = 30_000;
+const MIN_BUY   = 0.5;
+const TIMER_DEF = 60_000;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 const short  = (a) => a ? `${a.slice(0,4)}...${a.slice(-4)}` : "—";
