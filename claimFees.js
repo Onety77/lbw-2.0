@@ -1,24 +1,37 @@
 /**
- * claimFees.js — Auto-claim pump.fun + PumpSwap creator fees
- * Works for both bonding curve and post-graduation automatically.
+ * claimFees.js — Auto-claim creator fees from both pump.fun and PumpSwap
+ * ─────────────────────────────────────────────────────────────────────────
+ * Handles both phases automatically:
+ *   Phase 1 (bonding curve): claims from pump.fun creator vault
+ *   Phase 2 (after graduation): claims from PumpSwap creator vault
+ *
+ * No manual intervention needed at graduation. Both vaults are checked
+ * every CLAIM_INTERVAL_MS. Whichever has a balance gets claimed.
  */
 
 const {
-  PublicKey, Transaction, TransactionInstruction,
-  SystemProgram, sendAndConfirmTransaction, LAMPORTS_PER_SOL,
+  PublicKey, Transaction,
+  TransactionInstruction, SystemProgram,
+  sendAndConfirmTransaction, LAMPORTS_PER_SOL,
 } = require("@solana/web3.js");
 
-const PUMP_PROGRAM_ID     = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-const PUMPSWAP_PROGRAM_ID = new PublicKey("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
+// ── Program IDs ───────────────────────────────────────────────────────────────
+const PUMP_PROGRAM_ID    = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+const PUMPSWAP_PROGRAM_ID= new PublicKey("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
 
-// Anchor discriminators
-const PUMP_DISCRIMINATOR     = Buffer.from([20, 22, 86, 123, 198, 28, 219, 132]);
-const PUMPSWAP_DISCRIMINATOR = Buffer.from([160, 57, 89, 42, 181, 139, 43, 66]);
+// ── Anchor discriminators ─────────────────────────────────────────────────────
+// sha256("global:collect_creator_fee")[0..8]
+const PUMP_COLLECT_DISCRIMINATOR     = Buffer.from([20, 22, 86, 123, 198, 28, 219, 132]);
+// sha256("global:collect_coin_creator_fee")[0..8]
+const PUMPSWAP_COLLECT_DISCRIMINATOR = Buffer.from([160, 57, 89, 42, 181, 139, 43, 66]);
 
-const CLAIM_INTERVAL_MS  = 15_000;    // 
-const MIN_CLAIM_LAMPORTS = 10_000_000; // 0.01 SOL minimum
+// ── Config ────────────────────────────────────────────────────────────────────
+const CLAIM_INTERVAL_MS  = 20 * 1000;   // claim every 30 seconds
+const MIN_CLAIM_LAMPORTS = 100_000_000;   // skip if under 0.001 SOL (rent dust)
 
 // ── PDA derivations ───────────────────────────────────────────────────────────
+
+// pump.fun creator vault: ["creator-vault", creator_pubkey]
 function derivePumpVault(creatorPubkey) {
   const [pda] = PublicKey.findProgramAddressSync(
     [Buffer.from("creator-vault"), creatorPubkey.toBuffer()],
@@ -27,6 +40,7 @@ function derivePumpVault(creatorPubkey) {
   return pda;
 }
 
+// pump.fun event authority: ["__event_authority"]
 function derivePumpEventAuthority() {
   const [pda] = PublicKey.findProgramAddressSync(
     [Buffer.from("__event_authority")],
@@ -35,6 +49,7 @@ function derivePumpEventAuthority() {
   return pda;
 }
 
+// PumpSwap creator vault authority: ["creator_vault", creator_pubkey]
 function derivePumpSwapVaultAuthority(creatorPubkey) {
   const [pda] = PublicKey.findProgramAddressSync(
     [Buffer.from("creator_vault"), creatorPubkey.toBuffer()],
@@ -43,6 +58,7 @@ function derivePumpSwapVaultAuthority(creatorPubkey) {
   return pda;
 }
 
+// PumpSwap event authority: ["__event_authority"]
 function derivePumpSwapEventAuthority() {
   const [pda] = PublicKey.findProgramAddressSync(
     [Buffer.from("__event_authority")],
@@ -51,93 +67,133 @@ function derivePumpSwapEventAuthority() {
   return pda;
 }
 
-// ── Claim pump.fun fees ───────────────────────────────────────────────────────
+// ── Phase 1: pump.fun bonding curve fee claim ─────────────────────────────────
 async function claimPumpFees(connection, creatorKP, log) {
-  const vaultPDA   = derivePumpVault(creatorKP.publicKey);
-  const eventAuth  = derivePumpEventAuthority();
+  const creatorPubkey     = creatorKP.publicKey;
+  const vaultPDA          = derivePumpVault(creatorPubkey);
+  const eventAuthorityPDA = derivePumpEventAuthority();
 
   let balance = 0;
   try { balance = await connection.getBalance(vaultPDA); } catch { return 0; }
   if (balance <= MIN_CLAIM_LAMPORTS) return 0;
 
-  log(`  [pump.fun] Vault: ◎${(balance/LAMPORTS_PER_SOL).toFixed(6)} — claiming...`);
+  log("  [pump.fun] Vault: " + (balance/LAMPORTS_PER_SOL).toFixed(6) + " SOL — claiming...");
 
   try {
     const ix = new TransactionInstruction({
       programId: PUMP_PROGRAM_ID,
-      data: PUMP_DISCRIMINATOR,
+      data: PUMP_COLLECT_DISCRIMINATOR,
       keys: [
-        { pubkey: creatorKP.publicKey,     isSigner: true,  isWritable: true  },
+        { pubkey: creatorPubkey,           isSigner: true,  isWritable: true  },
         { pubkey: vaultPDA,                isSigner: false, isWritable: true  },
         { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: eventAuth,               isSigner: false, isWritable: false },
+        { pubkey: eventAuthorityPDA,       isSigner: false, isWritable: false },
         { pubkey: PUMP_PROGRAM_ID,         isSigner: false, isWritable: false },
       ],
     });
+
+    const tx  = new Transaction().add(ix);
     const sig = await sendAndConfirmTransaction(
-      connection, new Transaction().add(ix), [creatorKP], { commitment: "confirmed" }
+      connection, tx, [creatorKP], { commitment: "confirmed" }
     );
-    log(`  [pump.fun] Claimed ◎${(balance/LAMPORTS_PER_SOL).toFixed(6)} | TX: ${sig}`);
-    return balance / LAMPORTS_PER_SOL;
+    const claimed = balance / LAMPORTS_PER_SOL;
+    log("  [pump.fun] Claimed " + claimed.toFixed(6) + " SOL | TX: " + sig);
+    return claimed;
+
   } catch (e) {
     const msg = e.message || "";
-    if (!msg.includes("AccountNotFound") && !msg.includes("does not exist"))
-      log(`  [pump.fun] Error: ${msg.split("\n")[0]}`);
+    // Vault not initialized yet — normal before first trade
+    if (msg.includes("AccountNotFound") || msg.includes("does not exist")) return 0;
+    log("  [pump.fun] Error: " + msg.split("\n")[0]);
     return 0;
   }
 }
 
-// ── Claim PumpSwap fees (post-graduation) ─────────────────────────────────────
+// ── Phase 2: PumpSwap (post-graduation) fee claim ────────────────────────────
+// After graduation, fees accumulate in a WSOL ATA owned by the vault authority.
+// The collect_coin_creator_fee instruction unwraps WSOL → SOL into creator wallet.
 async function claimPumpSwapFees(connection, creatorKP, log) {
-  const vaultAuth  = derivePumpSwapVaultAuthority(creatorKP.publicKey);
-  const eventAuth  = derivePumpSwapEventAuthority();
-  const RENT_EXEMPT = 890_880;
+  const creatorPubkey        = creatorKP.publicKey;
+  const vaultAuthority       = derivePumpSwapVaultAuthority(creatorPubkey);
+  const eventAuthorityPDA    = derivePumpSwapEventAuthority();
 
+  // The vault authority's native SOL balance tells us if there's anything to claim
   let balance = 0;
-  try { balance = await connection.getBalance(vaultAuth); } catch { return 0; }
-  if (balance <= RENT_EXEMPT + MIN_CLAIM_LAMPORTS) return 0;
+  try { balance = await connection.getBalance(vaultAuthority); } catch { return 0; }
 
-  const claimable = balance - RENT_EXEMPT;
-  log(`  [pumpswap] Vault: ◎${(claimable/LAMPORTS_PER_SOL).toFixed(6)} — claiming...`);
+  // PumpSwap keeps rent in the authority — only claim if meaningfully above rent
+  if (balance <= 2_000_000) return 0; // 0.002 SOL threshold for PumpSwap
+
+  log("  [pumpswap] Vault authority: " + (balance/LAMPORTS_PER_SOL).toFixed(6) + " SOL — claiming...");
 
   try {
+    // PumpSwap collect_coin_creator_fee accounts:
+    // creator, vault_authority, system_program, event_authority, program
     const ix = new TransactionInstruction({
       programId: PUMPSWAP_PROGRAM_ID,
-      data: PUMPSWAP_DISCRIMINATOR,
+      data: PUMPSWAP_COLLECT_DISCRIMINATOR,
       keys: [
-        { pubkey: creatorKP.publicKey,     isSigner: true,  isWritable: true  },
-        { pubkey: vaultAuth,               isSigner: false, isWritable: true  },
+        { pubkey: creatorPubkey,           isSigner: true,  isWritable: true  },
+        { pubkey: vaultAuthority,          isSigner: false, isWritable: true  },
         { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: eventAuth,               isSigner: false, isWritable: false },
+        { pubkey: eventAuthorityPDA,       isSigner: false, isWritable: false },
         { pubkey: PUMPSWAP_PROGRAM_ID,     isSigner: false, isWritable: false },
       ],
     });
+
+    const tx  = new Transaction().add(ix);
     const sig = await sendAndConfirmTransaction(
-      connection, new Transaction().add(ix), [creatorKP], { commitment: "confirmed" }
+      connection, tx, [creatorKP], { commitment: "confirmed" }
     );
-    log(`  [pumpswap] Claimed ◎${(claimable/LAMPORTS_PER_SOL).toFixed(6)} | TX: ${sig}`);
-    return claimable / LAMPORTS_PER_SOL;
+    const claimed = balance / LAMPORTS_PER_SOL;
+    log("  [pumpswap] Claimed " + claimed.toFixed(6) + " SOL | TX: " + sig);
+    return claimed;
+
   } catch (e) {
     const msg = e.message || "";
-    if (!msg.includes("AccountNotFound") && !msg.includes("does not exist") && !msg.includes("custom program error"))
-      log(`  [pumpswap] Error: ${msg.split("\n")[0]}`);
+    if (msg.includes("AccountNotFound") || msg.includes("does not exist")) return 0;
+    // PumpSwap vault not initialized yet — normal before graduation
+    if (msg.includes("custom program error") || msg.includes("0x")) return 0;
+    log("  [pumpswap] Error: " + msg.split("\n")[0]);
     return 0;
   }
+}
+
+// ── Main claim — tries both, logs which phase is active ──────────────────────
+async function claimAllFees(connection, creatorKP, log) {
+  const pumpClaimed     = await claimPumpFees(connection, creatorKP, log);
+  const pumpSwapClaimed = await claimPumpSwapFees(connection, creatorKP, log);
+  const total = pumpClaimed + pumpSwapClaimed;
+  if (total > 0) {
+    log("  [claim] Total claimed: " + total.toFixed(6) + " SOL");
+  }
+  return total;
 }
 
 // ── Start auto-claim loop ─────────────────────────────────────────────────────
 function startAutoClaimFees(connection, creatorKP, log) {
-  log(`[AutoClaim] pump.fun vault  : ${derivePumpVault(creatorKP.publicKey).toBase58()}`);
-  log(`[AutoClaim] PumpSwap vault  : ${derivePumpSwapVaultAuthority(creatorKP.publicKey).toBase58()}`);
-  log(`[AutoClaim] Interval: ${CLAIM_INTERVAL_MS/1000}s | Min: ◎${MIN_CLAIM_LAMPORTS/LAMPORTS_PER_SOL}`);
+  const pumpVault    = derivePumpVault(creatorKP.publicKey);
+  const swapAuthority= derivePumpSwapVaultAuthority(creatorKP.publicKey);
 
-  const run = async () => {
-    await claimPumpFees(connection, creatorKP, log).catch(() => {});
-    await claimPumpSwapFees(connection, creatorKP, log).catch(() => {});
-  };
+  log("[AutoClaim] pump.fun vault  : " + pumpVault.toBase58());
+  log("[AutoClaim] PumpSwap vault  : " + swapAuthority.toBase58());
+  log("[AutoClaim] Interval        : " + (CLAIM_INTERVAL_MS/1000) + "s");
+  log("[AutoClaim] Min threshold   : " + (MIN_CLAIM_LAMPORTS/LAMPORTS_PER_SOL) + " SOL");
 
-  run();
-  setInterval(run, CLAIM_INTERVAL_MS);
+  // Claim immediately on boot
+  claimAllFees(connection, creatorKP, log).catch(() => {});
+
+  // Then on interval
+  setInterval(() => {
+    claimAllFees(connection, creatorKP, log).catch(() => {});
+  }, CLAIM_INTERVAL_MS);
 }
 
-module.exports = { startAutoClaimFees };
+module.exports = {
+  startAutoClaimFees,
+  claimAllFees,
+  claimPumpFees,
+  claimPumpSwapFees,
+  derivePumpVault,
+  derivePumpSwapVaultAuthority,
+};
