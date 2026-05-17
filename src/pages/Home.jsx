@@ -230,7 +230,7 @@ function Leaderboard({ entries, isMobile }) {
   if (!entries?.length) {
     return (
       <div style={{ border:"1px solid var(--border)", borderRadius:4, background:"var(--bg2)", padding:"40px 24px", textAlign:"center" }}>
-        <div style={{ fontFamily:"'Space Mono',monospace", fontSize:10, color:"var(--grey-dim)", letterSpacing:4 }}>WAITING FOR FIRST BUY...</div>
+        <div style={{ fontFamily:"'Space Mono',monospace", fontSize:10, color:"var(--grey-dim)", letterSpacing:4 }}>WAITING FOR FIRST BUY....</div>
         <div style={{ fontFamily:"'Inter',sans-serif", fontSize:11, color:"var(--grey-dim)", marginTop:8, opacity:0.5 }}>Minimum ◎{MIN_BUY} SOL to qualify</div>
       </div>
     );
