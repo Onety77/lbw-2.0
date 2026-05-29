@@ -1,8 +1,8 @@
 /**
- * Last Buyer Wins — Engine v5
- * - Queue-based tx processing — no RPC flooding
- * - Leaderboard always accepts new qualifying buys
- * - 5% holder filter using on-chain data
+ * Last Buyer Wins — Engine v6
+ * - Queue-based tx processing
+ * - Dynamic minimum buy based on market cap (DexScreener)
+ * - Shrinking timer reset as qualifying buys accumulate
  * - WebSocket + poll backup
  */
 
@@ -21,12 +21,21 @@ const { getFirestore, FieldValue, Timestamp } = require("firebase-admin/firestor
 const CREATOR_WALLET  = process.env.CREATOR_WALLET;
 const TOKEN_CA        = process.env.TOKEN_CA;
 const SOLANA_RPC      = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
-const GAS_RESERVE_SOL = parseFloat(process.env.GAS_RESERVE_SOL || "0.1");
-const MIN_BUY_SOL     = parseFloat(process.env.MIN_BUY_SOL     || "0.1");
-const TIMER_MS        = parseInt(process.env.TIMER_MS          || "60000");
-const MAX_HOLDER_PCT  = parseFloat(process.env.MAX_HOLDER_PCT  || "5");
-const SPLIT_THRESHOLD = parseFloat(process.env.SPLIT_THRESHOLD || "1.0"); // SOL
-const POLL_MS         = 3000; // poll every 3s
+const GAS_RESERVE_SOL = parseFloat(process.env.GAS_RESERVE_SOL  || "0.1");
+const TIMER_MS_MAX    = parseInt(process.env.TIMER_MS           || "60000");  // starting reset
+const TIMER_MS_MIN    = parseInt(process.env.TIMER_MS_MIN       || "5000");   // floor
+const TIMER_STEP_BUYS = parseInt(process.env.TIMER_STEP_BUYS    || "3");      // buys per step-down
+const TIMER_STEP_MS   = parseInt(process.env.TIMER_STEP_MS      || "5000");   // ms removed per step
+const MAX_HOLDER_PCT  = parseFloat(process.env.MAX_HOLDER_PCT   || "5");
+const SPLIT_THRESHOLD = parseFloat(process.env.SPLIT_THRESHOLD  || "1.0");
+const POLL_MS         = 3000;
+
+// Market-cap tiers — configurable via env, defaults match user spec
+const MC_TIERS = [
+  { maxUSD: 35_000,   minBuySol: parseFloat(process.env.MIN_BUY_TIER1 || "0.2") },
+  { maxUSD: 100_000,  minBuySol: parseFloat(process.env.MIN_BUY_TIER2 || "0.5") },
+  { maxUSD: Infinity, minBuySol: parseFloat(process.env.MIN_BUY_TIER3 || "1.0") },
+];
 
 // ── VALIDATE ──────────────────────────────────────────────────────────────────
 ["CREATOR_PRIVATE_KEY","FIREBASE_SERVICE_ACCOUNT_JSON","CREATOR_WALLET","TOKEN_CA"]
@@ -76,31 +85,75 @@ async function sendSOL(to, lamports) {
   );
 }
 
+// ── DYNAMIC MIN BUY ───────────────────────────────────────────────────────────
+function calcMinBuy(mcUSD) {
+  for (const tier of MC_TIERS) {
+    if (mcUSD < tier.maxUSD) return tier.minBuySol;
+  }
+  return MC_TIERS[MC_TIERS.length - 1].minBuySol;
+}
+
+let marketCapUSD     = 0;
+let currentMinBuySol = MC_TIERS[0].minBuySol; // start at lowest tier
+
+async function updateMarketCap() {
+  try {
+    const res  = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${TOKEN_CA}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    // DexScreener returns an array of pairs; use the highest-liquidity one
+    const pairs = data?.pairs;
+    if (!pairs?.length) return;
+    const pair = pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+    const mc   = pair.marketCap || pair.fdv || 0;
+    if (!mc) return;
+
+    marketCapUSD = mc;
+    const newMin = calcMinBuy(mc);
+    if (newMin !== currentMinBuySol) {
+      currentMinBuySol = newMin;
+      log(`[MarketCap] $${mc.toLocaleString()} → min buy now ◎${newMin} SOL`);
+    }
+    await db.doc("lbw_stats/global").set({ marketCapUSD: mc, currentMinBuySol }, { merge: true }).catch(() => {});
+  } catch (e) {
+    log(`[MarketCap] error: ${e.message}`);
+  }
+}
+
+async function marketCapLoop() {
+  while (true) {
+    await updateMarketCap();
+    await sleep(60_000);
+  }
+}
+
+// ── DYNAMIC TIMER ─────────────────────────────────────────────────────────────
+let buyCountThisRound = 0;
+
+function getResetMs() {
+  const steps = Math.floor(buyCountThisRound / TIMER_STEP_BUYS);
+  return Math.max(TIMER_MS_MIN, TIMER_MS_MAX - steps * TIMER_STEP_MS);
+}
+
 // ── HOLDER CHECK ──────────────────────────────────────────────────────────────
 async function isQualifiedBuyer(wallet) {
   try {
     const mintPub   = new PublicKey(TOKEN_CA);
     const walletPub = new PublicKey(wallet);
-
     const [tokenAccts, mintInfo] = await Promise.all([
       connection.getParsedTokenAccountsByOwner(walletPub, { mint: mintPub }),
       connection.getParsedAccountInfo(mintPub),
     ]);
-
     if (tokenAccts.value.length === 0) return { qualified: true, pct: 0 };
-
     const walletBal  = tokenAccts.value[0].account.data.parsed.info.tokenAmount.uiAmount || 0;
     const supplyRaw  = mintInfo.value?.data?.parsed?.info?.supply;
     const decimals   = mintInfo.value?.data?.parsed?.info?.decimals ?? 6;
-
     if (!supplyRaw) return { qualified: true, pct: 0 };
-
     const totalSupply = parseInt(supplyRaw) / Math.pow(10, decimals);
     const pct         = (walletBal / totalSupply) * 100;
-
     return { qualified: pct < MAX_HOLDER_PCT, pct };
   } catch {
-    return { qualified: true, pct: 0 }; // allow on error
+    return { qualified: true, pct: 0 };
   }
 }
 
@@ -108,13 +161,10 @@ async function isQualifiedBuyer(wallet) {
 function calculateShares(entries, potSOL) {
   const n = entries.length;
   if (n === 0) return [];
-
   const useSplit = potSOL >= SPLIT_THRESHOLD && n > 1;
-
   return entries.map((e, i) => {
     let pct, sol;
     if (!useSplit || n === 1) {
-      // Below threshold or only one player — leader takes all
       pct = i === 0 ? 100 : 0;
       sol = i === 0 ? potSOL : 0;
     } else if (i === 0) {
@@ -123,20 +173,12 @@ function calculateShares(entries, potSOL) {
       pct = 50 / (n - 1);
       sol = (potSOL * 0.5) / (n - 1);
     }
-    return {
-      ...e,
-      position:     i + 1,
-      sharePercent: Math.round(pct * 100) / 100,
-      shareSol:     Math.round(sol * 1e6) / 1e6,
-    };
+    return { ...e, position: i + 1, sharePercent: Math.round(pct * 100) / 100, shareSol: Math.round(sol * 1e6) / 1e6 };
   });
 }
 
-// Always allows new entries — pushes out oldest if over 10
 function addToLeaderboard(current, newEntry) {
-  // Remove same wallet if already in board (they rebought — move to front)
   const without = current.filter(e => e.wallet !== newEntry.wallet);
-  // Add at front, keep max 10
   return [newEntry, ...without].slice(0, 5);
 }
 
@@ -148,10 +190,9 @@ let isPayingOut    = false;
 let processedSigs  = new Set();
 let lastSigSeen    = null;
 let lastLeaderTime = 0;
-const LEADER_COOLDOWN = 2000; // min 2s between leader updates
+const LEADER_COOLDOWN = 2000;
 
-// ── TX PROCESSING QUEUE ───────────────────────────────────────────────────────
-// Prevents flooding the RPC with concurrent getTransaction calls
+// ── TX QUEUE ──────────────────────────────────────────────────────────────────
 const txQueue    = [];
 let queueRunning = false;
 
@@ -159,8 +200,7 @@ function enqueueTx(sig) {
   if (processedSigs.has(sig)) return;
   processedSigs.add(sig);
   if (processedSigs.size > 2000) {
-    const arr = Array.from(processedSigs);
-    processedSigs = new Set(arr.slice(-1000));
+    processedSigs = new Set(Array.from(processedSigs).slice(-1000));
   }
   txQueue.push(sig);
   runQueue();
@@ -169,22 +209,24 @@ function enqueueTx(sig) {
 async function runQueue() {
   if (queueRunning) return;
   queueRunning = true;
-
   while (txQueue.length > 0) {
     const sig = txQueue.shift();
     await processTx(sig).catch(() => {});
-    await sleep(300); // 300ms between tx fetches — gentle on RPC
+    await sleep(300);
   }
-
   queueRunning = false;
 }
 
 // ── FIRESTORE PUSH ────────────────────────────────────────────────────────────
 async function pushState(potSOL) {
   const withShares = calculateShares(leaderboard, potSOL);
+  const resetMs    = getResetMs();
   await db.doc("lbw_stats/global").set({
-    currentPotSOL: potSOL,
-    splitThreshold: SPLIT_THRESHOLD,
+    currentPotSOL:     potSOL,
+    splitThreshold:    SPLIT_THRESHOLD,
+    currentMinBuySol,
+    currentResetMs:    resetMs,
+    buyCountThisRound,
     leaderboard: withShares.map(e => ({
       position:     e.position,
       wallet:       e.wallet,
@@ -203,37 +245,37 @@ async function pushState(potSOL) {
 // ── TIMER ─────────────────────────────────────────────────────────────────────
 function resetTimer() {
   if (winTimer) clearTimeout(winTimer);
-  const nextWinAt = Date.now() + TIMER_MS;
+  const resetMs   = getResetMs();
+  const nextWinAt = Date.now() + resetMs;
   db.doc("lbw_stats/global")
-    .set({ nextWinAt: Timestamp.fromMillis(nextWinAt) }, { merge: true })
+    .set({ nextWinAt: Timestamp.fromMillis(nextWinAt), currentResetMs: resetMs, buyCountThisRound }, { merge: true })
     .catch(() => {});
-  winTimer = setTimeout(triggerPayout, TIMER_MS);
-  log(`  ⏱ Timer reset — ${TIMER_MS/1000}s`);
+  winTimer = setTimeout(triggerPayout, resetMs);
+  log(`  ⏱ Timer reset — ${resetMs / 1000}s (buy #${buyCountThisRound})`);
 }
 
 // ── ON QUALIFYING BUY ─────────────────────────────────────────────────────────
 async function onBuy(wallet, solAmount, sig, tsMs) {
-  // Cooldown — prevent rapid-fire updates
   const now = Date.now();
   if (now - lastLeaderTime < LEADER_COOLDOWN) return;
   lastLeaderTime = now;
 
-  // Holder check
   const { qualified, pct } = await isQualifiedBuyer(wallet);
   if (!qualified) {
     log(`  [skip] ${wallet.slice(0,8)}... holds ${pct.toFixed(1)}% — disqualified`);
     return;
   }
 
-  log(`  ★ NEW LEADER: ${wallet.slice(0,8)}... ◎${solAmount.toFixed(4)}`);
+  buyCountThisRound++;
+  const resetMs = getResetMs();
+  log(`  ★ LEADER: ${wallet.slice(0,8)}... ◎${solAmount.toFixed(4)} | Resets to: ${resetMs/1000}s | Buy #${buyCountThisRound}`);
+
   leaderboard = addToLeaderboard(leaderboard, { wallet, amount: solAmount, sig, tsMs });
 
   const bal = await getWalletBalance().catch(() => 0);
   const pot = Math.max(0, bal - GAS_RESERVE_SOL);
   await pushState(pot).catch(e => log(`  Firestore error: ${e.message}`));
-
-  const splitActive = pot >= SPLIT_THRESHOLD;
-  log(`  Pot: ◎${pot.toFixed(4)} | Players: ${leaderboard.length}/5 | Split: ${splitActive ? "YES" : "NO (below ◎"+SPLIT_THRESHOLD+")"}`);
+  log(`  Pot: ◎${pot.toFixed(4)} | Players: ${leaderboard.length}/5 | MinBuy: ◎${currentMinBuySol}`);
 
   resetTimer();
 }
@@ -261,25 +303,18 @@ async function triggerPayout() {
       if (sendSOLAmt <= 0) { log("Still empty — new round."); await startNewRound(); isPayingOut = false; return; }
     }
 
-    const sendLam    = Math.floor(sendSOLAmt * LAMPORTS_PER_SOL);
-    const useSplit   = sendSOLAmt >= SPLIT_THRESHOLD && n > 1;
-
+    const sendLam  = Math.floor(sendSOLAmt * LAMPORTS_PER_SOL);
+    const useSplit = sendSOLAmt >= SPLIT_THRESHOLD && n > 1;
     log(`Pot: ◎${sendSOLAmt.toFixed(6)} | Split: ${useSplit ? `YES (${n} winners)` : "NO (last buyer takes all)"}`);
 
-    // Calculate payouts
     const payouts = snapshot.map((e, i) => {
       let lam;
-      if (!useSplit || n === 1) {
-        lam = i === 0 ? sendLam : 0;
-      } else if (i === 0) {
-        lam = Math.floor(sendLam / 2);
-      } else {
-        lam = Math.floor(sendLam / 2 / (n - 1));
-      }
+      if (!useSplit || n === 1) { lam = i === 0 ? sendLam : 0; }
+      else if (i === 0)         { lam = Math.floor(sendLam / 2); }
+      else                      { lam = Math.floor(sendLam / 2 / (n - 1)); }
       return { ...e, lam, sol: lam / LAMPORTS_PER_SOL };
     }).filter(p => p.lam > 0);
 
-    // Send sequentially
     const results = [];
     for (const p of payouts) {
       try {
@@ -293,22 +328,17 @@ async function triggerPayout() {
       }
     }
 
-    const totalPaid   = results.filter(r => r.ok).reduce((s, r) => s + r.sol, 0);
+    const totalPaid     = results.filter(r => r.ok).reduce((s, r) => s + r.sol, 0);
     const actualWinners = results.filter(r => r.ok && r.sol > 0);
 
-    // Only write history if something was actually paid out
     if (totalPaid > 0 && actualWinners.length > 0) {
       await db.collection("lbw_history").add({
         round: roundNumber, pot: sendSOLAmt, totalPaid,
-        numWinners: actualWinners.length,
-        splitUsed: useSplit,
+        numWinners: actualWinners.length, splitUsed: useSplit,
         timestamp: Timestamp.now(),
         winners: actualWinners.map((r, i) => ({
-          position:  i + 1,
-          wallet:    r.wallet,
-          buyAmount: r.amount,
-          payout:    r.sol,
-          txSig:     r.txSig || null,
+          position: i + 1, wallet: r.wallet,
+          buyAmount: r.amount, payout: r.sol, txSig: r.txSig || null,
         })),
       });
     } else {
@@ -328,7 +358,6 @@ async function triggerPayout() {
 
     log(`Done — ◎${totalPaid.toFixed(6)} paid out`);
     log(`${"=".repeat(50)}\n`);
-
   } catch (e) {
     log(`PAYOUT ERROR: ${e.message}`);
   }
@@ -340,11 +369,12 @@ async function triggerPayout() {
 // ── NEW ROUND ─────────────────────────────────────────────────────────────────
 async function startNewRound() {
   roundNumber++;
-  leaderboard    = [];
-  processedSigs  = new Set();
-  lastSigSeen    = null;
-  lastLeaderTime = 0;
-  txQueue.length = 0;
+  leaderboard       = [];
+  processedSigs     = new Set();
+  lastSigSeen       = null;
+  lastLeaderTime    = 0;
+  txQueue.length    = 0;
+  buyCountThisRound = 0;
   log(`Round ${roundNumber} started.`);
 
   const bal = await getWalletBalance().catch(() => 0);
@@ -352,7 +382,10 @@ async function startNewRound() {
   await db.doc("lbw_stats/global").set({
     currentPotSOL: pot, leaderboard: [],
     lastBuyer: null, lastBuyAt: null, lastBuySOL: null,
-    nextWinAt: Timestamp.fromMillis(Date.now() + TIMER_MS),
+    nextWinAt:         Timestamp.fromMillis(Date.now() + TIMER_MS_MAX),
+    currentResetMs:    TIMER_MS_MAX,
+    buyCountThisRound: 0,
+    currentMinBuySol,
   }, { merge: true });
 
   resetTimer();
@@ -365,7 +398,6 @@ async function processTx(sig) {
       maxSupportedTransactionVersion: 0,
       commitment: "confirmed",
     });
-
     if (!tx?.meta) return;
 
     const accounts = tx.transaction.message.staticAccountKeys
@@ -373,18 +405,15 @@ async function processTx(sig) {
     const pre  = tx.meta.preBalances  || [];
     const post = tx.meta.postBalances || [];
 
-    // Find account that spent most SOL
     let maxDec = 0, buyerIdx = -1;
     for (let i = 0; i < pre.length; i++) {
       const dec = pre[i] - post[i];
       if (dec > maxDec && dec > 10_000) { maxDec = dec; buyerIdx = i; }
     }
-
     if (buyerIdx === -1) return;
 
     const solSpent = maxDec / LAMPORTS_PER_SOL;
     const buyer    = accounts[buyerIdx].toString();
-
     const skip = [
       CREATOR_WALLET, TOKEN_CA,
       "11111111111111111111111111111111",
@@ -396,12 +425,11 @@ async function processTx(sig) {
     const tsMs = tx.blockTime ? tx.blockTime * 1000 : Date.now();
     log(`  [tx] ${sig.slice(0,16)}... | ${buyer.slice(0,8)}... | ◎${solSpent.toFixed(4)}`);
 
-    if (solSpent >= MIN_BUY_SOL && !isPayingOut) {
+    if (solSpent >= currentMinBuySol && !isPayingOut) {
       await onBuy(buyer, solSpent, sig, tsMs);
     }
-
   } catch (e) {
-    if (!e.message?.includes("429")) return; // silent unless rate limit
+    if (!e.message?.includes("429")) return;
     log(`  [tx] 429 on ${sig.slice(0,12)} — will retry via poll`);
   }
 }
@@ -429,25 +457,15 @@ async function pollLoop(mintPubkey) {
     try {
       const opts = { limit: 5, commitment: "confirmed" };
       if (lastSigSeen) opts.until = lastSigSeen;
-
       const sigs = await connection.getSignaturesForAddress(mintPubkey, opts);
       if (!sigs || sigs.length === 0) continue;
-
-      if (!lastSigSeen) {
-        lastSigSeen = sigs[0].signature;
-        log(`Poll cursor: ${lastSigSeen.slice(0,16)}...`);
-        continue;
-      }
-
+      if (!lastSigSeen) { lastSigSeen = sigs[0].signature; continue; }
       const fresh = sigs.filter(s => !s.err);
       if (fresh.length > 0) {
         lastSigSeen = fresh[0].signature;
-        log(`  [poll] ${fresh.length} new tx(s)`);
         fresh.forEach(s => enqueueTx(s.signature));
       }
-    } catch (e) {
-      log(`  [poll] error: ${e.message}`);
-    }
+    } catch (e) { log(`  [poll] error: ${e.message}`); }
   }
 }
 
@@ -464,15 +482,14 @@ async function balanceLoop() {
 }
 
 // ── BOOT ──────────────────────────────────────────────────────────────────────
-console.log(`\n  LAST BUYER WINS — Engine v5\n`);
+console.log(`\n  LAST BUYER WINS — Engine v6\n`);
 log(`Wallet         : ${CREATOR_WALLET}`);
 log(`Token          : ${TOKEN_CA}`);
-log(`Min Buy        : ◎${MIN_BUY_SOL} SOL`);
-log(`Timer          : ${TIMER_MS/1000}s`);
+log(`Timer          : ${TIMER_MS_MAX/1000}s max → ${TIMER_MS_MIN/1000}s min (every ${TIMER_STEP_BUYS} buys -${TIMER_STEP_MS/1000}s)`);
+log(`Min Buy Tiers  : ◎${MC_TIERS[0].minBuySol} (<$35k) | ◎${MC_TIERS[1].minBuySol} (<$100k) | ◎${MC_TIERS[2].minBuySol} ($100k+)`);
 log(`Gas Reserve    : ◎${GAS_RESERVE_SOL}`);
-log(`Split Threshold: ◎${SPLIT_THRESHOLD} SOL`);
+log(`Split Threshold: ◎${SPLIT_THRESHOLD}`);
 log(`Max Holding    : ${MAX_HOLDER_PCT}%`);
-log(`Detection      : WebSocket + ${POLL_MS/1000}s poll`);
 log("─".repeat(50));
 
 db.doc("lbw_stats/global").get().then(snap => {
@@ -480,16 +497,21 @@ db.doc("lbw_stats/global").get().then(snap => {
     db.doc("lbw_stats/global").set({
       currentPotSOL: 0, totalPaid: 0, totalRounds: 0, biggestPot: 0,
       leaderboard: [], lastBuyer: null, lastBuyAt: null,
-      nextWinAt: Timestamp.fromMillis(Date.now() + TIMER_MS),
+      nextWinAt:         Timestamp.fromMillis(Date.now() + TIMER_MS_MAX),
+      currentResetMs:    TIMER_MS_MAX,
+      buyCountThisRound: 0,
+      currentMinBuySol:  MC_TIERS[0].minBuySol,
+      marketCapUSD:      0,
     });
     log("Firestore initialized.");
   }
 }).catch(e => log(`Init error: ${e.message}`));
 
 const mintPubkey = new PublicKey(TOKEN_CA);
-
 startAutoClaimFees(connection, creatorKP, log);
+updateMarketCap();   // initial market cap fetch before first round
 startNewRound();
 startWebSocket(mintPubkey);
 pollLoop(mintPubkey);
 balanceLoop();
+marketCapLoop();

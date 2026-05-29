@@ -2,37 +2,32 @@ import { useState, useEffect, useRef } from "react";
 import { doc, onSnapshot } from "firebase/firestore";
 import { db } from "./firebase";
 
-const TIMER_DEF = 60_000;
-
 const fmtTime = (ms) => {
   if (ms <= 0) return "00:00";
   const s = Math.floor(ms / 1000);
   return `${String(Math.floor(s / 60)).padStart(2,"0")}:${String(s % 60).padStart(2,"0")}`;
 };
 
-export default function FloatingTimer() {
-  const [countdown, setCountdown] = useState(TIMER_DEF);
+export default function FloatingTimer({ navigate }) {
+  const [countdown, setCountdown] = useState(60_000);
   const [visible,   setVisible]   = useState(true);
   const [soundOn,   setSoundOn]   = useState(false);
+  const [resetMs,   setResetMs]   = useState(60_000);
+  const [buyCount,  setBuyCount]  = useState(0);
 
-  const winAtRef    = useRef(null);
-  const lastSecRef  = useRef(null);
-  const audioCtxRef = useRef(null);  // one persistent AudioContext
-  const soundOnRef  = useRef(false); // ref mirrors state so interval always sees current value
-  const lockedRef   = useRef(false); // true while waiting for new nextWinAt after round ends
+  const winAtRef      = useRef(null);
+  const lastSecRef    = useRef(null);
+  const audioCtxRef   = useRef(null);
+  const soundOnRef    = useRef(false);
+  const lockedRef     = useRef(false);
+  const wasLockedRef  = useRef(false);
 
-  // Keep ref in sync with state
   useEffect(() => { soundOnRef.current = soundOn; }, [soundOn]);
 
-  // Create AudioContext once on first sound toggle (needs user gesture)
   const ensureAudioCtx = () => {
-    if (!audioCtxRef.current) {
+    if (!audioCtxRef.current)
       audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    // Resume if browser suspended it
-    if (audioCtxRef.current.state === "suspended") {
-      audioCtxRef.current.resume();
-    }
+    if (audioCtxRef.current.state === "suspended") audioCtxRef.current.resume();
     return audioCtxRef.current;
   };
 
@@ -41,138 +36,144 @@ export default function FloatingTimer() {
       const ctx  = ensureAudioCtx();
       const osc  = ctx.createOscillator();
       const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
+      osc.connect(gain); gain.connect(ctx.destination);
       osc.frequency.value = urgent ? 1000 : 520;
       gain.gain.setValueAtTime(urgent ? 0.12 : 0.06, ctx.currentTime);
       gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
-      osc.start(ctx.currentTime);
-      osc.stop(ctx.currentTime + 0.08);
+      osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.08);
     } catch {}
   };
 
-  // Firestore listener
+  // Firestore listener — also drives auto-show on new round
   useEffect(() => {
     return onSnapshot(doc(db, "lbw_stats", "global"), snap => {
       if (!snap.exists()) return;
       const d = snap.data();
+      if (d.currentResetMs)       setResetMs(d.currentResetMs);
+      if (d.buyCountThisRound != null) setBuyCount(d.buyCountThisRound);
       if (d.nextWinAt) {
         const nextMs = d.nextWinAt.toMillis();
-        // Only accept if it's in the future — this is a fresh round
         if (nextMs > Date.now()) {
-          winAtRef.current = nextMs;
-          lockedRef.current = false; // unlock — new round started
-          lastSecRef.current = null;  // reset tick tracker
+          // New round or buy reset — if we were locked (timer hit 00:00), auto-show again
+          if (lockedRef.current || wasLockedRef.current) {
+            setVisible(true);
+            wasLockedRef.current = false;
+          }
+          winAtRef.current   = nextMs;
+          lockedRef.current  = false;
+          lastSecRef.current = null;
         }
       }
     });
   }, []);
 
-  // Countdown interval — stable, never recreated
+  // Countdown interval — updates title too
   useEffect(() => {
     const id = setInterval(() => {
       if (!winAtRef.current) return;
-
       const rem = winAtRef.current - Date.now();
 
       if (rem <= 0) {
-        // Timer expired — lock at 00:00 until engine sends new nextWinAt
         setCountdown(0);
         if (!lockedRef.current) {
-          lockedRef.current = true;
-          lastSecRef.current = null;
+          lockedRef.current    = true;
+          wasLockedRef.current = true;
+          lastSecRef.current   = null;
+          document.title       = "⏳ LAST BUYER WINS";
         }
         return;
       }
 
-      if (lockedRef.current) return; // waiting for new round — stay at 00:00
-
+      if (lockedRef.current) return;
       setCountdown(rem);
 
-      // Tick only when second changes
+      // Live page title
+      document.title = `[${fmtTime(rem)}] LAST BUYER WINS`;
+
+      // Tick sound — only on second boundary
       if (soundOnRef.current) {
-        const currentSec = Math.floor(rem / 1000);
-        if (currentSec !== lastSecRef.current) {
-          lastSecRef.current = currentSec;
+        const sec = Math.floor(rem / 1000);
+        if (sec !== lastSecRef.current) {
+          lastSecRef.current = sec;
           playTick(rem < 15_000);
         }
       }
     }, 200);
-    return () => clearInterval(id);
-  }, []); // empty deps — runs once, uses refs for live values
+    return () => {
+      clearInterval(id);
+      document.title = "LAST BUYER WINS";
+    };
+  }, []);
 
   if (!visible) return null;
 
   const urgent  = countdown > 0 && countdown < 15_000;
   const warning = countdown > 0 && countdown < 30_000 && !urgent;
   const color   = urgent ? "#FF2020" : warning ? "#FFB800" : "#39FF14";
+  const maxSec  = Math.round(resetMs / 1000);
 
   return (
-    <div style={{
-      position:      "fixed",
-      bottom:        24,
-      right:         24,
-      zIndex:        999,
-      display:       "flex",
-      alignItems:    "center",
-      gap:           10,
-      padding:       "10px 16px",
-      background:    "rgba(13,13,13,0.95)",
-      border:        `1px solid ${color}44`,
-      borderRadius:  40,
-      backdropFilter:"blur(12px)",
-      boxShadow:     urgent
-        ? `0 0 24px rgba(255,32,32,0.4), 0 4px 20px rgba(0,0,0,0.5)`
-        : `0 0 16px ${color}22, 0 4px 20px rgba(0,0,0,0.5)`,
-      animation:     urgent ? "urgent-shake 0.4s ease infinite" : "fade-in 0.4s ease",
-      transition:    "border-color 0.3s, box-shadow 0.3s",
-      userSelect:    "none",
-    }}>
-      {/* Live dot */}
-      <div style={{
-        width:8, height:8, borderRadius:"50%",
-        background:color, boxShadow:`0 0 8px ${color}`,
-        animation:"blink 1.5s ease infinite", flexShrink:0,
-      }}/>
+    <div style={{ position:"fixed", bottom:24, right:24, zIndex:999, display:"flex", flexDirection:"column", alignItems:"flex-end", gap:5 }}>
 
-      {/* Timer */}
+      {/* Buy count + reset label */}
+      {buyCount > 0 && (
+        <div style={{
+          padding:"4px 11px", background:"rgba(13,13,13,0.92)",
+          border:"1px solid rgba(255,255,255,0.06)", borderRadius:20,
+          backdropFilter:"blur(8px)",
+        }}>
+          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"#666", letterSpacing:1 }}>
+            {buyCount} buy{buyCount !== 1 ? "s" : ""}
+          </span>
+          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"#444", margin:"0 4px" }}>·</span>
+          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color: urgent ? "#FF2020" : warning ? "#FFB800" : "#555" }}>
+            resets {maxSec}s
+          </span>
+        </div>
+      )}
+
+      {/* Main pill */}
       <div style={{
-        fontFamily:  "'Space Mono',monospace",
-        fontSize:    18, fontWeight:700,
-        color, letterSpacing:"-0.02em", lineHeight:1,
-        animation:   urgent ? "countdown-pulse 0.5s ease infinite" : "none",
+        display:"flex", alignItems:"center", gap:10,
+        padding:"10px 16px",
+        background:"rgba(13,13,13,0.95)",
+        border:`1px solid ${color}44`,
+        borderRadius:40, backdropFilter:"blur(12px)",
+        boxShadow: urgent
+          ? `0 0 24px rgba(255,32,32,0.4), 0 4px 20px rgba(0,0,0,0.5)`
+          : `0 0 16px ${color}22, 0 4px 20px rgba(0,0,0,0.5)`,
+        animation: urgent ? "urgent-shake 0.4s ease infinite" : "fade-in 0.4s ease",
+        transition:"border-color 0.3s, box-shadow 0.3s",
+        userSelect:"none",
       }}>
-        {fmtTime(countdown)}
+        {/* Live dot */}
+        <div style={{ width:8, height:8, borderRadius:"50%", background:color, boxShadow:`0 0 8px ${color}`, animation:"blink 1.5s ease infinite", flexShrink:0 }}/>
+
+        {/* Countdown */}
+        <div style={{
+          fontFamily:"'Space Mono',monospace", fontSize:18, fontWeight:700,
+          color, letterSpacing:"-0.02em", lineHeight:1,
+          animation: urgent ? "countdown-pulse 0.5s ease infinite" : "none",
+        }}>
+          {fmtTime(countdown)}
+        </div>
+
+        {/* Sound toggle */}
+        <button
+          onClick={() => { ensureAudioCtx(); setSoundOn(s => !s); }}
+          title={soundOn ? "Mute ticking" : "Enable ticking"}
+          style={{ background:"none", border:"none", cursor:"pointer", fontSize:12, lineHeight:1, padding:"0 2px", opacity:soundOn ? 1 : 0.35, transition:"opacity 0.2s" }}
+        >🔔</button>
+
+        {/* Close — hides until next round */}
+        <button
+          onClick={() => setVisible(false)}
+          title="Hide until next round"
+          style={{ background:"none", border:"none", cursor:"pointer", color:"rgba(255,255,255,0.3)", fontSize:13, lineHeight:1, padding:"0 0 0 2px", transition:"color 0.2s" }}
+          onMouseEnter={e => e.currentTarget.style.color="rgba(255,255,255,0.7)"}
+          onMouseLeave={e => e.currentTarget.style.color="rgba(255,255,255,0.3)"}
+        >×</button>
       </div>
-
-      {/* Sound toggle */}
-      <button
-        onClick={() => {
-          ensureAudioCtx(); // create/resume on user gesture
-          setSoundOn(s => !s);
-        }}
-        title={soundOn ? "Mute ticking" : "Enable ticking"}
-        style={{
-          background:"none", border:"none", cursor:"pointer",
-          fontSize:12, lineHeight:1, padding:"0 2px",
-          opacity: soundOn ? 1 : 0.35,
-          transition:"opacity 0.2s",
-        }}
-      >
-        🔔
-      </button>
-
-      {/* Close */}
-      <button
-        onClick={() => setVisible(false)}
-        style={{
-          background:"none", border:"none", cursor:"pointer",
-          color:"rgba(255,255,255,0.3)", fontSize:13,
-          lineHeight:1, padding:"0 0 0 2px", transition:"color 0.2s",
-        }}
-        onMouseEnter={e => e.currentTarget.style.color="rgba(255,255,255,0.7)"}
-        onMouseLeave={e => e.currentTarget.style.color="rgba(255,255,255,0.3)"}
-      >×</button>
     </div>
   );
 }
