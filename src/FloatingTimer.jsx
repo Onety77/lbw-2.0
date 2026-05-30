@@ -5,7 +5,7 @@ import { db } from "./firebase";
 const fmtTime = (ms) => {
   if (ms <= 0) return "00:00";
   const s = Math.floor(ms / 1000);
-  return `${String(Math.floor(s / 60)).padStart(2,"0")}:${String(s % 60).padStart(2,"0")}`;
+  return `${String(Math.floor(s / 60)).padStart(2,"00")}:${String(s % 60).padStart(2,"00")}`;
 };
 
 export default function FloatingTimer({ navigate }) {
