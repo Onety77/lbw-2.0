@@ -95,6 +95,14 @@ body::after {
   0%   { transform:rotate(0deg) translateY(0); opacity:1; }
   100% { transform:rotate(720deg) translateY(110vh); opacity:0; }
 }
+@keyframes modal-slide-up {
+  from { opacity:0; transform:translateY(24px) scale(0.97); }
+  to   { opacity:1; transform:translateY(0) scale(1); }
+}
+@keyframes bounce-down {
+  0%,100% { transform:translateX(-50%) translateY(0); }
+  50%      { transform:translateX(-50%) translateY(8px); }
+}
 
 /* ── Buttons ── */
 .btn {

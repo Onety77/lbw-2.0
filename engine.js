@@ -1,8 +1,8 @@
 /**
- * Last Buyer Wins — Engine v6
+ * Last Buyer Wins — Engine v7
  * - Queue-based tx processing
  * - Dynamic minimum buy based on market cap (DexScreener)
- * - Shrinking timer reset as qualifying buys accumulate
+ * - Shrinking timer: every 1 real-time minute → reset drops 5s, floor 10s
  * - WebSocket + poll backup
  */
 
@@ -22,10 +22,9 @@ const CREATOR_WALLET  = process.env.CREATOR_WALLET;
 const TOKEN_CA        = process.env.TOKEN_CA;
 const SOLANA_RPC      = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
 const GAS_RESERVE_SOL = parseFloat(process.env.GAS_RESERVE_SOL  || "0.1");
-const TIMER_MS_MAX    = parseInt(process.env.TIMER_MS           || "60000");  // starting reset
-const TIMER_MS_MIN    = parseInt(process.env.TIMER_MS_MIN       || "5000");   // floor
-const TIMER_STEP_BUYS = parseInt(process.env.TIMER_STEP_BUYS    || "3");      // buys per step-down
-const TIMER_STEP_MS   = parseInt(process.env.TIMER_STEP_MS      || "5000");   // ms removed per step
+const TIMER_MS_MAX    = parseInt(process.env.TIMER_MS           || "60000");  // starting reset (60s)
+const TIMER_MS_MIN    = parseInt(process.env.TIMER_MS_MIN       || "10000");  // floor (10s)
+const TIMER_STEP_MS   = parseInt(process.env.TIMER_STEP_MS      || "5000");   // ms removed per minute
 const MAX_HOLDER_PCT  = parseFloat(process.env.MAX_HOLDER_PCT   || "5");
 const SPLIT_THRESHOLD = parseFloat(process.env.SPLIT_THRESHOLD  || "1.0");
 const POLL_MS         = 3000;
@@ -94,14 +93,13 @@ function calcMinBuy(mcUSD) {
 }
 
 let marketCapUSD     = 0;
-let currentMinBuySol = MC_TIERS[0].minBuySol; // start at lowest tier
+let currentMinBuySol = MC_TIERS[0].minBuySol;
 
 async function updateMarketCap() {
   try {
     const res  = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${TOKEN_CA}`);
     if (!res.ok) return;
     const data = await res.json();
-    // DexScreener returns an array of pairs; use the highest-liquidity one
     const pairs = data?.pairs;
     if (!pairs?.length) return;
     const pair = pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
@@ -127,12 +125,29 @@ async function marketCapLoop() {
   }
 }
 
-// ── DYNAMIC TIMER ─────────────────────────────────────────────────────────────
-let buyCountThisRound = 0;
+// ── DYNAMIC TIMER (time-based) ────────────────────────────────────────────────
+// Every 1 real-time minute elapsed in the round, reset duration drops by TIMER_STEP_MS.
+// Floor: TIMER_MS_MIN (default 10s). Resets to TIMER_MS_MAX on new round.
+let buyCountThisRound = 0; // display only
+let roundStartTime    = Date.now();
 
 function getResetMs() {
-  const steps = Math.floor(buyCountThisRound / TIMER_STEP_BUYS);
+  const elapsedMin = (Date.now() - roundStartTime) / 60_000;
+  const steps      = Math.floor(elapsedMin);
   return Math.max(TIMER_MS_MIN, TIMER_MS_MAX - steps * TIMER_STEP_MS);
+}
+
+// Pushes updated currentResetMs to Firestore every 30s so frontend stays in sync
+async function timerShrinkLoop() {
+  while (true) {
+    await sleep(30_000);
+    if (isPayingOut) continue;
+    try {
+      const newResetMs     = getResetMs();
+      const roundElapsedMs = Math.floor(Date.now() - roundStartTime);
+      await db.doc("lbw_stats/global").set({ currentResetMs: newResetMs, roundElapsedMs }, { merge: true });
+    } catch {}
+  }
 }
 
 // ── HOLDER CHECK ──────────────────────────────────────────────────────────────
@@ -219,14 +234,16 @@ async function runQueue() {
 
 // ── FIRESTORE PUSH ────────────────────────────────────────────────────────────
 async function pushState(potSOL) {
-  const withShares = calculateShares(leaderboard, potSOL);
-  const resetMs    = getResetMs();
+  const withShares     = calculateShares(leaderboard, potSOL);
+  const resetMs        = getResetMs();
+  const roundElapsedMs = Math.floor(Date.now() - roundStartTime);
   await db.doc("lbw_stats/global").set({
     currentPotSOL:     potSOL,
     splitThreshold:    SPLIT_THRESHOLD,
     currentMinBuySol,
     currentResetMs:    resetMs,
     buyCountThisRound,
+    roundElapsedMs,
     leaderboard: withShares.map(e => ({
       position:     e.position,
       wallet:       e.wallet,
@@ -245,13 +262,15 @@ async function pushState(potSOL) {
 // ── TIMER ─────────────────────────────────────────────────────────────────────
 function resetTimer() {
   if (winTimer) clearTimeout(winTimer);
-  const resetMs   = getResetMs();
-  const nextWinAt = Date.now() + resetMs;
+  const resetMs        = getResetMs();
+  const nextWinAt      = Date.now() + resetMs;
+  const roundElapsedMs = Math.floor(Date.now() - roundStartTime);
   db.doc("lbw_stats/global")
-    .set({ nextWinAt: Timestamp.fromMillis(nextWinAt), currentResetMs: resetMs, buyCountThisRound }, { merge: true })
+    .set({ nextWinAt: Timestamp.fromMillis(nextWinAt), currentResetMs: resetMs, buyCountThisRound, roundElapsedMs }, { merge: true })
     .catch(() => {});
   winTimer = setTimeout(triggerPayout, resetMs);
-  log(`  ⏱ Timer reset — ${resetMs / 1000}s (buy #${buyCountThisRound})`);
+  const elapsedMin = Math.floor(roundElapsedMs / 60_000);
+  log(`  ⏱ Timer reset — ${resetMs / 1000}s (round min ${elapsedMin}, buy #${buyCountThisRound})`);
 }
 
 // ── ON QUALIFYING BUY ─────────────────────────────────────────────────────────
@@ -375,6 +394,7 @@ async function startNewRound() {
   lastLeaderTime    = 0;
   txQueue.length    = 0;
   buyCountThisRound = 0;
+  roundStartTime    = Date.now();
   log(`Round ${roundNumber} started.`);
 
   const bal = await getWalletBalance().catch(() => 0);
@@ -385,6 +405,7 @@ async function startNewRound() {
     nextWinAt:         Timestamp.fromMillis(Date.now() + TIMER_MS_MAX),
     currentResetMs:    TIMER_MS_MAX,
     buyCountThisRound: 0,
+    roundElapsedMs:    0,
     currentMinBuySol,
   }, { merge: true });
 
@@ -482,10 +503,10 @@ async function balanceLoop() {
 }
 
 // ── BOOT ──────────────────────────────────────────────────────────────────────
-console.log(`\n  LAST BUYER WINS — Engine v6\n`);
+console.log(`\n  LAST BUYER WINS — Engine v7\n`);
 log(`Wallet         : ${CREATOR_WALLET}`);
 log(`Token          : ${TOKEN_CA}`);
-log(`Timer          : ${TIMER_MS_MAX/1000}s max → ${TIMER_MS_MIN/1000}s min (every ${TIMER_STEP_BUYS} buys -${TIMER_STEP_MS/1000}s)`);
+log(`Timer          : ${TIMER_MS_MAX/1000}s max → ${TIMER_MS_MIN/1000}s floor (shrinks ${TIMER_STEP_MS/1000}s per real minute)`);
 log(`Min Buy Tiers  : ◎${MC_TIERS[0].minBuySol} (<$35k) | ◎${MC_TIERS[1].minBuySol} (<$100k) | ◎${MC_TIERS[2].minBuySol} ($100k+)`);
 log(`Gas Reserve    : ◎${GAS_RESERVE_SOL}`);
 log(`Split Threshold: ◎${SPLIT_THRESHOLD}`);
@@ -500,6 +521,7 @@ db.doc("lbw_stats/global").get().then(snap => {
       nextWinAt:         Timestamp.fromMillis(Date.now() + TIMER_MS_MAX),
       currentResetMs:    TIMER_MS_MAX,
       buyCountThisRound: 0,
+      roundElapsedMs:    0,
       currentMinBuySol:  MC_TIERS[0].minBuySol,
       marketCapUSD:      0,
     });
@@ -509,9 +531,10 @@ db.doc("lbw_stats/global").get().then(snap => {
 
 const mintPubkey = new PublicKey(TOKEN_CA);
 startAutoClaimFees(connection, creatorKP, log);
-updateMarketCap();   // initial market cap fetch before first round
+updateMarketCap();
 startNewRound();
 startWebSocket(mintPubkey);
 pollLoop(mintPubkey);
 balanceLoop();
 marketCapLoop();
+timerShrinkLoop();

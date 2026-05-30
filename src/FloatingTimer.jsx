@@ -12,15 +12,16 @@ export default function FloatingTimer({ navigate }) {
   const [countdown, setCountdown] = useState(60_000);
   const [visible,   setVisible]   = useState(true);
   const [soundOn,   setSoundOn]   = useState(false);
-  const [resetMs,   setResetMs]   = useState(60_000);
-  const [buyCount,  setBuyCount]  = useState(0);
+  const [resetSec,  setResetSec]  = useState(60);
+  const [atFloor,   setAtFloor]   = useState(false);
+  const [nextShrinkSec, setNextShrinkSec] = useState(null);
 
-  const winAtRef      = useRef(null);
-  const lastSecRef    = useRef(null);
-  const audioCtxRef   = useRef(null);
-  const soundOnRef    = useRef(false);
-  const lockedRef     = useRef(false);
-  const wasLockedRef  = useRef(false);
+  const winAtRef     = useRef(null);
+  const lastSecRef   = useRef(null);
+  const audioCtxRef  = useRef(null);
+  const soundOnRef   = useRef(false);
+  const lockedRef    = useRef(false);
+  const wasLockedRef = useRef(false);
 
   useEffect(() => { soundOnRef.current = soundOn; }, [soundOn]);
 
@@ -44,30 +45,42 @@ export default function FloatingTimer({ navigate }) {
     } catch {}
   };
 
-  // Firestore listener — also drives auto-show on new round
+  // Firestore listener
   useEffect(() => {
     return onSnapshot(doc(db, "lbw_stats", "global"), snap => {
       if (!snap.exists()) return;
       const d = snap.data();
-      if (d.currentResetMs)       setResetMs(d.currentResetMs);
-      if (d.buyCountThisRound != null) setBuyCount(d.buyCountThisRound);
+
+      if (d.currentResetMs) {
+        const rs = Math.round(d.currentResetMs / 1000);
+        setResetSec(rs);
+        setAtFloor(rs <= 10);
+      }
+
+      if (d.roundElapsedMs != null && d.currentResetMs) {
+        const elapsedMin  = Math.floor(d.roundElapsedMs / 60_000);
+        const nextShrinkMs = ((elapsedMin + 1) * 60_000) - d.roundElapsedMs;
+        const rs = Math.round(d.currentResetMs / 1000);
+        if (rs > 10) setNextShrinkSec(Math.ceil(nextShrinkMs / 1000));
+        else         setNextShrinkSec(null);
+      }
+
       if (d.nextWinAt) {
         const nextMs = d.nextWinAt.toMillis();
         if (nextMs > Date.now()) {
-          // New round or buy reset — if we were locked (timer hit 00:00), auto-show again
           if (lockedRef.current || wasLockedRef.current) {
             setVisible(true);
             wasLockedRef.current = false;
           }
-          winAtRef.current   = nextMs;
-          lockedRef.current  = false;
+          winAtRef.current  = nextMs;
+          lockedRef.current = false;
           lastSecRef.current = null;
         }
       }
     });
   }, []);
 
-  // Countdown interval — updates title too
+  // Countdown interval + page title
   useEffect(() => {
     const id = setInterval(() => {
       if (!winAtRef.current) return;
@@ -86,11 +99,8 @@ export default function FloatingTimer({ navigate }) {
 
       if (lockedRef.current) return;
       setCountdown(rem);
-
-      // Live page title
       document.title = `[${fmtTime(rem)}] LAST BUYER WINS`;
 
-      // Tick sound — only on second boundary
       if (soundOnRef.current) {
         const sec = Math.floor(rem / 1000);
         if (sec !== lastSecRef.current) {
@@ -110,24 +120,34 @@ export default function FloatingTimer({ navigate }) {
   const urgent  = countdown > 0 && countdown < 15_000;
   const warning = countdown > 0 && countdown < 30_000 && !urgent;
   const color   = urgent ? "#FF2020" : warning ? "#FFB800" : "#39FF14";
-  const maxSec  = Math.round(resetMs / 1000);
 
   return (
     <div style={{ position:"fixed", bottom:24, right:24, zIndex:999, display:"flex", flexDirection:"column", alignItems:"flex-end", gap:5 }}>
 
-      {/* Buy count + reset label */}
-      {buyCount > 0 && (
+      {/* Shrink info pill */}
+      {!atFloor && nextShrinkSec && (
         <div style={{
           padding:"4px 11px", background:"rgba(13,13,13,0.92)",
           border:"1px solid rgba(255,255,255,0.06)", borderRadius:20,
           backdropFilter:"blur(8px)",
         }}>
-          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"#666", letterSpacing:1 }}>
-            {buyCount} buy{buyCount !== 1 ? "s" : ""}
+          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"#555", letterSpacing:1 }}>
+            resets {resetSec}s
           </span>
-          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"#444", margin:"0 4px" }}>·</span>
-          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color: urgent ? "#FF2020" : warning ? "#FFB800" : "#555" }}>
-            resets {maxSec}s
+          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"#333", margin:"0 5px" }}>·</span>
+          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"#444", letterSpacing:1 }}>
+            shrinks in {nextShrinkSec}s
+          </span>
+        </div>
+      )}
+      {atFloor && (
+        <div style={{
+          padding:"4px 11px", background:"rgba(13,13,13,0.92)",
+          border:"1px solid rgba(255,255,255,0.06)", borderRadius:20,
+          backdropFilter:"blur(8px)",
+        }}>
+          <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color: urgent?"#FF2020":"#FFB800", letterSpacing:1 }}>
+            floor · resets {resetSec}s
           </span>
         </div>
       )}
@@ -146,10 +166,8 @@ export default function FloatingTimer({ navigate }) {
         transition:"border-color 0.3s, box-shadow 0.3s",
         userSelect:"none",
       }}>
-        {/* Live dot */}
         <div style={{ width:8, height:8, borderRadius:"50%", background:color, boxShadow:`0 0 8px ${color}`, animation:"blink 1.5s ease infinite", flexShrink:0 }}/>
 
-        {/* Countdown */}
         <div style={{
           fontFamily:"'Space Mono',monospace", fontSize:18, fontWeight:700,
           color, letterSpacing:"-0.02em", lineHeight:1,
@@ -158,20 +176,18 @@ export default function FloatingTimer({ navigate }) {
           {fmtTime(countdown)}
         </div>
 
-        {/* Sound toggle */}
         <button
-          onClick={() => { ensureAudioCtx(); setSoundOn(s => !s); }}
+          onClick={()=>{ ensureAudioCtx(); setSoundOn(s=>!s); }}
           title={soundOn ? "Mute ticking" : "Enable ticking"}
-          style={{ background:"none", border:"none", cursor:"pointer", fontSize:12, lineHeight:1, padding:"0 2px", opacity:soundOn ? 1 : 0.35, transition:"opacity 0.2s" }}
+          style={{ background:"none", border:"none", cursor:"pointer", fontSize:12, lineHeight:1, padding:"0 2px", opacity:soundOn?1:0.35, transition:"opacity 0.2s" }}
         >🔔</button>
 
-        {/* Close — hides until next round */}
         <button
-          onClick={() => setVisible(false)}
+          onClick={()=>setVisible(false)}
           title="Hide until next round"
           style={{ background:"none", border:"none", cursor:"pointer", color:"rgba(255,255,255,0.3)", fontSize:13, lineHeight:1, padding:"0 0 0 2px", transition:"color 0.2s" }}
-          onMouseEnter={e => e.currentTarget.style.color="rgba(255,255,255,0.7)"}
-          onMouseLeave={e => e.currentTarget.style.color="rgba(255,255,255,0.3)"}
+          onMouseEnter={e=>e.currentTarget.style.color="rgba(255,255,255,0.7)"}
+          onMouseLeave={e=>e.currentTarget.style.color="rgba(255,255,255,0.3)"}
         >×</button>
       </div>
     </div>
